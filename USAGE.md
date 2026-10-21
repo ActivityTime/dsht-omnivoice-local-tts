@@ -35,7 +35,7 @@ OmniVoice（k2-fsa / 小米 Next-gen Kaldi 开源 TTS，~0.6B 参数，扩散语
 | `models/OmniVoice/` | 模型权重（见 §2.1） | ✅ 必需 | **3.1 GB** |
 | `python/` | 内置 embeddable CPython 3.13 运行时 + 全部依赖 | ✅ 必需 | ~7 GB |
 | `history/` | 管理台请求归档（见 §3.5），运行时生成 | 产物 | 随使用增长 |
-| `voices/` | 声音克隆音色库（见 §3.6），运行时生成 | 产物 | 每音色约 7 KB + 原始音频 |
+| `voices/` | 声音克隆音色库（见 §3.7），运行时生成 | 产物 | 每音色约 7 KB + 原始音频 |
 | `download_model.py` | 从 hf-mirror 拉取模型权重的脚本 | 可选 | <1 KB |
 | `server.log` | 运行日志（启动后生成） | 产物 | 随运行增长 |
 | `test_out.mp3` / `test_out2.mp3` | 验证用生成产物 | 产物 | ~50/28 KB |
@@ -87,6 +87,7 @@ python\python.exe server.py > server.log 2>&1
 | `OMNI_TTS_CLONE_DIR` | `voices/` | 声音克隆音色库目录 |
 | `OMNI_TTS_LOG_API` | `0` | 是否也归档 OpenAI 端点（`/v1/audio/speech`）的请求；DSHT 逐条调用会持续写盘，默认关 |
 | `OMNI_TTS_ADMIN_PAGE` | `admin.html` | 管理台页面文件位置 |
+| `OMNI_TTS_TRAY` | `1` | 是否显示系统托盘图标（仅 Windows 有效）；`0` 关闭 |
 
 ### 3.4 健康检查
 ```bat
@@ -130,7 +131,24 @@ curl http://127.0.0.1:8890/health
 
 ---
 
-### 3.6 声音克隆（Voice Clone）
+### 3.6 系统托盘图标（通知区域）
+
+服务启动后自动在**系统托盘**（任务栏右下角通知区域，时钟旁边）放置一个常驻图标，不必开浏览器也能找到服务：
+
+| 操作 | 行为 |
+|---|---|
+| 左键单击 | 打开管理控制台（`http://127.0.0.1:8890/admin`） |
+| 右键菜单 → 打开管理台 | 同上 |
+| 右键菜单 → 复制 OpenAI 端点 | 复制 `http://127.0.0.1:8890/v1/audio/speech` 到剪贴板（填 DSHT Provider Endpoint 用） |
+| 右键菜单 → 退出服务 | 立即停止服务（`os._exit(0)`，无优雅停机，勿在有合成任务时点） |
+
+- **零依赖**：直接 ctypes 调 `Shell_NotifyIconW` + 自绘 32×32 ICO（圆角蓝底 + 白色音量条），不引入 pystray / Pillow。图标首次启动时写到 `tray.ico`（与 `server.py` 同目录），之后直接复用。
+- **开关**：环境变量 `OMNI_TTS_TRAY=0` 关闭；非 Windows 平台自动跳过。
+- 图标找不到时先看任务栏的「^」隐藏图标区——新图标可能被收在那里；explorer 重启后托盘图标会消失，需重启本服务才会重新注册（`NIM_ADD` 不跨 explorer 生命周期持久化）。
+
+---
+
+### 3.7 声音克隆（Voice Clone）
 
 属性造声（Voice Design）受**固定属性白名单**限制（EN 23 / ZH 25 项，无情绪轴、不可中英混用），
 做不出「某个具体角色 + 某种情绪」。声音克隆用一段参考音频绕开这个限制：音色与情绪都来自那段音频，
@@ -139,8 +157,25 @@ curl http://127.0.0.1:8890/health
 | 项 | 要求 |
 |---|---|
 | 参考音频 | 3–10 秒（>20 秒官方会警告：更慢、更占内存、克隆质量下降），wav/mp3/flac/ogg |
-| `ref_text` | **必填**：参考音频的逐字稿。留空会触发 Whisper ASR 自动转写（多占约 3 GB） |
-| 音色名称 | 不含 `\ / : * ? " < > \|`；创建后 `voice` 字段填这个名字即可 |
+| `ref_text` | 参考音频的逐字稿。**可留空**——见下方「同目录自动取」 |
+| 音色名称 | 可留空 = 用音频文件名（去扩展名）；已存在则自动追加 `_1`、`_2`… 不覆盖。手填的名称已存在则报 409 |
+
+**同目录自动取（ref_text 留空）**
+
+管理台的克隆卡片只走**本地音频路径**（音频文件的绝对路径，不要求在某个"库"里，任意位置都行）。
+`ref_text` 留空时，服务端直接读该音频**同目录**的同名文本，不做任何搜索/全库匹配：
+
+- 查找顺序：`<stem>.txt` → `<stem>.lab` → `<stem>.json`（json 取 `transcription` / `text` / `transcript`）。
+- 找不到直接报错，不会去触发 Whisper ASR（那要多吃约 3 GB 内存）。
+- 路径填目录 + 点「批量注册」则扫描目录下音频（按文件名排序，默认最多 20 条），
+  逐个取各自同目录的逐字稿，音色名 = 「音色名称」前缀 + 文件名。
+- 嫌打字麻烦就点路径框右侧的 **「选文件…」/「选目录…」**：由服务端进程弹出 Windows 原生
+  选择框（PowerShell + WinForms，**无需额外依赖**），选中后自动回填绝对路径。取消则返回空。
+
+> 为什么界面不做浏览器上传/文件选择器：浏览器只能拿到文件名，拿不到绝对路径，
+> 也就读不到音频旁边的同名文本——那条路对"同目录取逐字稿"是假的。
+> `POST /admin/voices` 仍接受 `audio` 表单字段（`ref_text` 必填），供脚本/curl 使用
+> （素材库的 `scripts/register.py` 就走这条）。
 
 **存储与缓存**（`voices/<name>.*`）：
 
@@ -155,7 +190,9 @@ curl http://127.0.0.1:8890/health
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/voices` | 音色库列表（只读元信息，不加载 prompt） |
-| POST | `/admin/voices` | multipart 上传：`name`、`ref_text`、`audio` |
+| POST | `/admin/voices` | `name`（可空）+ `local_path`（服务端读盘，`ref_text` 可留空）；`audio` 上传字段仍兼容（`ref_text` 必填） |
+| POST | `/admin/import-local` | `path`（目录或文件）+ `prefix` + `limit`：批量注册，逐字稿取音频同目录同名文本 |
+| POST | `/admin/pick-path` | `{"mode":"file"|"dir","title","initial_dir"}`：服务端弹原生选择框，返回选中路径（空=取消） |
 | DELETE | `/admin/voices/{name}` | 删除音色及其参考音频 |
 | GET | `/admin/voices/{name}/audio` | 回听原始参考音频 |
 

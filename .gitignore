@@ -13,6 +13,9 @@ server.log
 *.wav
 __pycache__/
 
+# ===== 系统托盘图标（server.py 可确定性重建，删了会自动再生）=====
+/tray.ico
+
 # ===== 声音克隆音色库（.pt prompt + 原始参考音频，运行时生成）=====
 /voices/
 *.pt

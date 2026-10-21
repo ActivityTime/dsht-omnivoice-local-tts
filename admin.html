@@ -97,6 +97,7 @@
   audio { width: 100%; height: 36px; margin: 4px 0 8px; }
   .rec-actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .empty { color: var(--text-dim); font-size: 13px; padding: 20px 0; text-align: center; }
+  code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-soft); padding: 1px 4px; border-radius: 4px; }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
 </style>
@@ -161,19 +162,44 @@
     <h2>声音克隆 · 音色库</h2>
     <div class="grid">
       <div>
-        <label for="vcName">音色名称</label>
+        <label for="vcName">音色名称（可留空）</label>
         <input id="vcName" placeholder="例如 狂三">
-        <div class="hint">创建后，上方 voice 填这个名字即可使用。</div>
+        <div class="hint">
+          留空 = 用音频<b>文件名</b>（去掉扩展名）当音色名；若已存在同名音色，自动追加
+          <code>_1</code>、<code>_2</code> 序号，不会覆盖。
+          手填的名称若已存在则报错（不静默改名）。批量注册时这里当前缀。
+        </div>
       </div>
       <div>
-        <label for="vcFile">参考音频（3–10 秒）</label>
-        <input id="vcFile" type="file" accept="audio/*,.wav,.mp3,.flac,.ogg">
-        <div class="hint">wav / mp3 / flac / ogg 均可。音色与情绪都来自这段。</div>
+        <label for="vcPath">本地音频路径</label>
+        <div class="row" style="margin-top:5px">
+          <input id="vcPath" style="flex:1" placeholder="I:\SomeResources\VoiceClonePrompt-ForOmniVoice\prompt\genshin\zh\Raiden_Shogun\clips\zh_Raiden_Shogun_0001.wav">
+          <button id="vcPickFile" type="button">选文件…</button>
+          <button id="vcPickDir" type="button">选目录…</button>
+        </div>
+        <div class="hint">
+          音频文件的<b>绝对路径</b>（不要求在某个"库"里，任意位置都行）。也可以点右侧按钮弹出
+          <b>系统原生选择框</b>（由服务端进程弹出，选中后自动回填）——浏览器自己的选择器拿不到绝对地址，所以不用它。
+        </div>
       </div>
       <div style="grid-column:1/-1">
-        <label for="vcText">ref_text · 这段音频在说什么（必填，逐字）</label>
+        <label for="vcText">ref_text · 这段音频在说什么（可留空）</label>
         <input id="vcText" placeholder="啊啦~啊啦~，你在看什么呀？">
-        <div class="hint">必须与音频内容逐字一致，多字少字都会让对齐漂移。留空会触发 ASR 自动转写，多占约 3GB 内存。</div>
+        <div class="hint">
+          <b>留空即可</b>：服务端直接读音频<b>同目录</b>的同名 <code>.txt</code> / <code>.lab</code> /
+          <code>.json</code>（json 取 <code>transcription</code>），不做任何搜索；找不到会直接报错，不会去跑 ASR。
+          手填则优先级更高。必须与音频内容逐字一致，多字少字都会让对齐漂移。
+        </div>
+      </div>
+      <div style="grid-column:1/-1">
+        <label for="vcLimit">批量注册目录</label>
+        <div class="row">
+          <span class="hint" style="margin:0">把上面的路径填成<b>目录</b>，按文件名逐个注册；逐字稿同样取各音频同目录的同名文本。</span>
+          <span class="spacer"></span>
+          <input id="vcLimit" type="number" value="20" min="1" max="200" style="width:80px" title="最多注册几条">
+          <button id="vcImport">批量注册</button>
+        </div>
+        <div class="hint">「创建音色」用于单个文件；「批量注册」用于整个目录（前缀用上面的音色名称）。</div>
       </div>
     </div>
     <div class="row">
@@ -386,37 +412,124 @@ async function loadVoices() {
   syncVoiceOptions();
 }
 
+/* ---- clone from a local path: server reads the file and its sibling transcript ---- */
+
+// 原生选择框由服务端进程弹出（PowerShell + WinForms），选中后回填路径框。
+async function pickPath(mode) {
+  const st = $("vcStatus");
+  const btn = mode === "dir" ? $("vcPickDir") : $("vcPickFile");
+  const cur = $("vcPath").value.trim();
+  // 对话框从当前路径所在目录打开，接着上次的位置
+  let init = "";
+  if (cur) init = /[\\/]$/.test(cur) ? cur : cur.replace(/[^\\/]+$/, "");
+  btn.disabled = true;
+  st.className = "busy";
+  st.textContent = mode === "dir"
+    ? "已弹出目录选择框（应出现在屏幕最前；没看到请切到桌面或检查任务栏）…"
+    : "已弹出文件选择框（应出现在屏幕最前；没看到请切到桌面或检查任务栏）…";
+  try {
+    const r = await fetch("/admin/pick-path", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mode,
+        title: mode === "dir" ? "选择参考音频目录" : "选择参考音频",
+        initial_dir: init,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok) { st.className = "err"; st.textContent = "选择框失败：" + (d.detail || r.status); return; }
+    if (d.path) {
+      $("vcPath").value = d.path;
+      st.className = "ok";
+      st.textContent = "已回填：" + d.path;
+    } else {
+      st.className = "ok";
+      st.textContent = "已取消选择。";
+    }
+  } catch (e) {
+    st.className = "err";
+    st.textContent = "请求异常：" + e;
+  } finally {
+    btn.disabled = false;
+  }
+}
+$("vcPickFile").onclick = () => pickPath("file");
+$("vcPickDir").onclick = () => pickPath("dir");
 $("vcAdd").onclick = async () => {
   const btn = $("vcAdd"), st = $("vcStatus");
   const name = $("vcName").value.trim();
-  const refText = $("vcText").value.trim();
-  const file = $("vcFile").files[0];
-  if (!name) { st.className = "err"; st.textContent = "请填音色名称"; return; }
-  if (!file) { st.className = "err"; st.textContent = "请选择参考音频文件"; return; }
-  if (!refText) { st.className = "err"; st.textContent = "ref_text 必填：这段音频的逐字稿"; return; }
-
-  const fd = new FormData();
-  fd.append("name", name);
-  fd.append("ref_text", refText);
-  fd.append("audio", file);
+  const manual = $("vcText").value.trim();
+  const localPath = $("vcPath").value.trim();
+  if (!localPath) {
+    st.className = "err";
+    st.textContent = "请填「本地音频路径」——浏览器选文件拿不到绝对地址，读不到同目录的逐字稿";
+    return;
+  }
 
   btn.disabled = true;
   st.className = "busy";
-  st.textContent = "正在克隆…（需编码参考音频，几秒到几十秒）";
+  st.textContent = name ? "正在克隆…（服务端读取本地音频）" : "正在克隆…（音色名取文件名）";
   try {
+    const fd = new FormData();
+    fd.append("name", name);
+    fd.append("ref_text", manual);
+    fd.append("local_path", localPath);
     const r = await fetch("/admin/voices", { method: "POST", body: fd });
     const d = await r.json();
-    if (!r.ok) { st.className = "err"; st.textContent = "失败：" + (d.detail || r.status); return; }
+    if (!r.ok) {
+      st.className = "err";
+      st.textContent = "失败：" + (d.detail || r.status) +
+        (String(d.detail || "").includes("不是文件") ? "（目录请用「批量注册」）" : "");
+      return;
+    }
     st.className = "ok";
     st.textContent = `已创建「${d.name}」，参考音频 ${d.duration}s。上方 voice 填这个名字即可使用。`;
-    $("vcName").value = ""; $("vcText").value = ""; $("vcFile").value = "";
+    $("vcName").value = ""; $("vcText").value = ""; $("vcPath").value = "";
     loadVoices();
   } catch (e) {
-    st.className = "err"; st.textContent = "请求异常：" + e;
+    st.className = "err";
+    st.textContent = "请求异常：" + e;
   } finally {
     btn.disabled = false;
   }
 };
+
+$("vcImport").onclick = async () => {
+  const btn = $("vcImport"), st = $("vcStatus");
+  const path = $("vcPath").value.trim();
+  if (!path) { st.className = "err"; st.textContent = "请先在「本地音频路径」填目录"; return; }
+  btn.disabled = true;
+  st.className = "busy";
+  st.textContent = "正在注册（逐字稿取音频同目录同名文本）…";
+  try {
+    const body = new URLSearchParams({
+      path,
+      prefix: $("vcName").value.trim(),
+      limit: $("vcLimit").value || "20",
+    });
+    const r = await fetch("/admin/import-local", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    const d = await r.json();
+    if (!r.ok) { st.className = "err"; st.textContent = "注册失败：" + (d.detail || r.status); return; }
+    const ok = (d.created || []).map((c) => `${c.name} ${c.duration}s`);
+    const skip = (d.skipped || []).map((s) => `${s.file}（${s.reason}）`);
+    st.className = ok.length ? "ok" : "err";
+    st.textContent =
+      `扫描 ${d.total} 条，创建 ${ok.length} 个：${ok.join("、") || "无"}。` +
+      (skip.length ? ` 跳过：${skip.join("、")}` : "");
+    if (ok.length) loadVoices();
+  } catch (e) {
+    st.className = "err";
+    st.textContent = "请求异常：" + e;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 
 $("vcList").addEventListener("click", async (ev) => {
   const btn = ev.target.closest("button[data-vact]");

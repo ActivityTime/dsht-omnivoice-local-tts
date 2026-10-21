@@ -18,16 +18,20 @@ is hard-coded to a specific machine.
 """
 from __future__ import annotations
 
+import base64
+import ctypes
 import io
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
 import uuid
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -74,6 +78,7 @@ os.environ.setdefault("HF_HOME", str(HERE / "hf"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HERE / "hf" / "hub"))
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile  # noqa: E402
+from fastapi.concurrency import run_in_threadpool  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import HTMLResponse, JSONResponse, Response  # noqa: E402
 import uvicorn  # noqa: E402
@@ -108,6 +113,7 @@ ADMIN_FILE = Path(os.environ.get("OMNI_TTS_ADMIN_PAGE", HERE / "admin.html"))
 # <name>.ref<ext> (the original upload, kept for playback).
 CLONE_DIR = Path(os.environ.get("OMNI_TTS_CLONE_DIR", HERE / "voices"))
 _CLONE_SUFFIX = ".pt"
+_AUDIO_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac")
 # Rejects path separators and Windows-reserved characters.
 _NAME_RE = re.compile(r"^[^\\/:*?\"<>|\r\n\t]{1,64}$")
 _clone_cache: dict[str, Any] = {}
@@ -571,45 +577,34 @@ def admin_voices() -> dict[str, Any]:
     return {"items": items, "total": len(items)}
 
 
-@app.post("/admin/voices", include_in_schema=False)
-async def admin_add_voice(
-    name: str = Form(...),
-    ref_text: str = Form(""),
-    audio: UploadFile = File(...),
-):
-    """Build a clone prompt from one reference clip and store it.
-
-    `ref_text` is mandatory on purpose: leaving it empty makes the model load
-    its Whisper ASR (~3 GB) to transcribe, and this host has no commit memory
-    to spare.
-    """
+def _decode_audio(raw: bytes) -> tuple[Any, int]:
+    """Decode uploaded bytes into a mono float32 waveform + sample rate."""
     import soundfile as sf  # noqa: PLC0415
-    import torch  # noqa: PLC0415
 
-    name = (name or "").strip()
-    if not _NAME_RE.match(name):
-        raise HTTPException(status_code=400, detail="invalid voice name")
-    ref_text = (ref_text or "").strip()
-    if not ref_text:
-        raise HTTPException(
-            status_code=400,
-            detail="ref_text 必填：参考音频的逐字稿（留空会触发 ASR 自动转写，多占约 3GB 内存）",
-        )
-
-    raw = await audio.read()
     if not raw:
         raise HTTPException(status_code=400, detail="audio is empty")
     try:
         data, sr = sf.read(io.BytesIO(raw), always_2d=False, dtype="float32")
     except Exception as error:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"无法解码音频：{error}")
-
     wave = np.asarray(data, dtype=np.float32)
     if wave.ndim == 2:  # soundfile returns (frames, channels)
         wave = wave.mean(axis=1)
     if wave.size == 0:
         raise HTTPException(status_code=400, detail="audio is empty after decode")
-    duration = float(wave.size) / float(sr)
+    return wave, int(sr)
+
+
+def _store_clone(
+    name: str,
+    wave: Any,
+    sr: int,
+    ref_text: str,
+    source: str,
+    raw: bytes | None = None,
+) -> dict[str, Any]:
+    """Encode a voice-clone prompt and persist prompt + reference audio + meta."""
+    import torch  # noqa: PLC0415
 
     model = get_model()
     try:
@@ -620,11 +615,13 @@ async def admin_add_voice(
         log.exception("voice clone prompt failed")
         raise HTTPException(status_code=500, detail=f"克隆失败：{error}")
 
+    duration = float(np.asarray(wave).size) / float(sr)
     CLONE_DIR.mkdir(parents=True, exist_ok=True)
     prompt.save(str(CLONE_DIR / f"{name}{_CLONE_SUFFIX}"))
-    suffix = Path(audio.filename or "").suffix.lower()
+    suffix = Path(source).suffix.lower()
     ref_suffix = f".ref{suffix}" if f".ref{suffix}" in _REF_SUFFIXES else ".ref.wav"
-    (CLONE_DIR / f"{name}{ref_suffix}").write_bytes(raw)
+    if raw:
+        (CLONE_DIR / f"{name}{ref_suffix}").write_bytes(raw)
     (CLONE_DIR / f"{name}.json").write_text(
         json.dumps(
             {
@@ -632,7 +629,7 @@ async def admin_add_voice(
                 "ref_text": ref_text,
                 "duration": round(duration, 2),
                 "sample_rate": int(sr),
-                "source": audio.filename or "",
+                "source": source,
                 "created": datetime.now().isoformat(timespec="seconds"),
             },
             ensure_ascii=False,
@@ -643,6 +640,451 @@ async def admin_add_voice(
     _clone_cache.pop(name, None)
     log.info("voice cloned: %s (%.1fs, %d chars ref_text)", name, duration, len(ref_text))
     return {"ok": True, "name": name, "duration": round(duration, 2)}
+
+
+@app.post("/admin/voices", include_in_schema=False)
+async def admin_add_voice(
+    name: str = Form(""),
+    ref_text: str = Form(""),
+    local_path: str = Form(""),
+    audio: UploadFile | None = File(None),
+):
+    """Build a clone prompt from one reference clip and store it.
+
+    Two ways to hand over the clip:
+
+    * `local_path` — a path on the server host. The audio is read straight off
+      disk, and when `ref_text` is empty the transcript is taken from the
+      **same directory** (`<stem>.txt` / `.lab` / `.json`). No searching.
+    * `audio` — a browser upload. Browsers cannot see sibling files, so an
+      empty `ref_text` is an error here unless the page already filled it in
+      from a same-named file the user selected alongside the audio.
+
+    `ref_text` stays mandatory in effect: leaving it truly empty makes the
+    model load its Whisper ASR (~3 GB) to transcribe, and this host has no
+    commit memory to spare.
+
+    An empty `name` is derived from the audio file name (extension stripped);
+    on collision the first free `<stem>_1`, `<stem>_2`, … is taken instead of
+    overwriting. A *typed* name that already exists is still a hard error.
+    """
+    typed_name = (name or "").strip()
+    ref_text = (ref_text or "").strip()
+    source_path = (local_path or "").strip()
+
+    if source_path:
+        resolved = _resolve_local(source_path)
+        if not resolved.is_file():
+            raise HTTPException(status_code=400, detail=f"本地路径不是文件：{resolved}")
+        raw = resolved.read_bytes()
+        filename = resolved.name
+    else:
+        if audio is None:
+            raise HTTPException(
+                status_code=400,
+                detail="请选择参考音频文件，或填写本地音频路径（服务端同目录取逐字稿）",
+            )
+        raw = await audio.read()
+        filename = audio.filename or ""
+
+    if typed_name:
+        if not _NAME_RE.match(typed_name):
+            raise HTTPException(status_code=400, detail="invalid voice name")
+        if _clone_path(typed_name).exists():
+            raise HTTPException(
+                status_code=409, detail=f"音色「{typed_name}」已存在，换个名字或先删除"
+            )
+        name = typed_name
+    else:
+        stem = _safe_name(Path(filename).stem)
+        if not stem:
+            raise HTTPException(
+                status_code=400,
+                detail="无法从文件名推导音色名（文件名为空或全是非法字符），请手填音色名称",
+            )
+        name = _unique_clone_name(stem)
+
+    if not ref_text:
+        if not source_path:
+            raise HTTPException(
+                status_code=400,
+                detail="ref_text 必填：浏览器上传拿不到同目录的同名文本，请手填逐字稿，"
+                "或改用「本地音频路径」（服务端直接读音频同目录的 .txt/.lab/.json）。"
+                "留空会触发 ASR 自动转写，多占约 3GB 内存。",
+            )
+        ref_text = _sidecar_text(resolved)
+        if not ref_text:
+            raise HTTPException(
+                status_code=400,
+                detail=f"音频同目录没有与「{resolved.stem}」同名的 "
+                f".txt/.lab/.json：{resolved.parent}",
+            )
+
+    wave, sr = _decode_audio(raw)
+    return _store_clone(name, wave, sr, ref_text, filename, raw=raw)
+
+
+@app.post("/admin/import-local", include_in_schema=False)
+def admin_import_local(
+    path: str = Form(...),
+    prefix: str = Form(""),
+    limit: int = Form(20),
+    overwrite: int = Form(0),
+) -> dict[str, Any]:
+    """Register every clip in a local directory.
+
+    Reads the audio off disk and takes each transcript from the **same
+    directory** (`<stem>.txt` / `.lab` / `.json`) — nothing is searched for.
+    Clips without a sibling transcript are skipped, never auto-transcribed.
+
+    `path`       file or directory on the server host
+    `prefix`     prepended to each stem to build the voice name
+    `limit`      max clips to import from a directory (sorted by name)
+    """
+    resolved = _resolve_local(path)
+    if not resolved.exists():
+        raise HTTPException(status_code=404, detail=f"路径不存在：{resolved}")
+
+    if resolved.is_file():
+        files = [resolved]
+    else:
+        files = sorted(
+            f
+            for f in resolved.iterdir()
+            if f.is_file() and f.suffix.lower() in _AUDIO_SUFFIXES
+        )[: max(1, min(200, int(limit or 20)))]
+
+    prefix_clean = _safe_name(prefix, trim=False) if (prefix or "").strip() else ""
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+
+    for f in files:
+        text = _sidecar_text(f)
+        if not text:
+            skipped.append({"file": f.name, "reason": "同目录没有同名 .txt/.lab/.json"})
+            continue
+        name = _safe_name(f"{prefix_clean}{f.stem}") if prefix_clean else _safe_name(f.stem)
+        if not name:
+            skipped.append({"file": f.name, "reason": f"非法音色名：{f.stem}"})
+            continue
+        if _clone_path(name).exists():
+            if not overwrite:
+                # 名称来自文件名：按用户规则自动加序号，而不是跳过
+                name = _unique_clone_name(name)
+        try:
+            raw = f.read_bytes()
+            wave, sr = _decode_audio(raw)
+        except HTTPException as error:
+            skipped.append({"file": f.name, "reason": str(error.detail)})
+            continue
+        except Exception as error:  # noqa: BLE001
+            skipped.append({"file": f.name, "reason": f"读取失败：{error}"})
+            continue
+        try:
+            created.append(_store_clone(name, wave, sr, text, f.name, raw=raw))
+        except HTTPException as error:
+            skipped.append({"file": f.name, "reason": str(error.detail)})
+
+    return {
+        "ok": True,
+        "path": str(resolved),
+        "created": created,
+        "skipped": skipped,
+        "total": len(files),
+    }
+
+
+_TEXT_SUFFIXES = (".txt", ".lab")
+_JSON_SUFFIX = ".json"
+_TRANSCRIPT_KEYS = ("transcription", "text", "transcript")
+
+
+def _sidecar_text(audio_path: Path) -> str:
+    """Read the transcript sitting **next to** `audio_path` (same stem).
+
+    Looks for `<stem>.txt` / `<stem>.lab` first, then `<stem>.json` with a
+    `transcription` / `text` / `transcript` field. Returns "" when absent.
+    """
+    for suffix in _TEXT_SUFFIXES:
+        candidate = audio_path.with_name(audio_path.stem + suffix)
+        if candidate.is_file():
+            try:
+                return candidate.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:  # noqa: BLE001
+                pass
+    js = audio_path.with_name(audio_path.stem + ".json")
+    if js.is_file():
+        try:
+            obj = json.loads(js.read_text(encoding="utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            return ""
+        for key in _TRANSCRIPT_KEYS:
+            if obj.get(key):
+                return str(obj[key]).strip()
+    return ""
+
+
+def _resolve_local(raw_path: str) -> Path:
+    """Expand + resolve a path typed on the admin page."""
+    target = Path(os.path.expandvars(os.path.expanduser((raw_path or "").strip())))
+    try:
+        return target.resolve()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"路径不可解析：{raw_path}")
+
+
+def _safe_name(raw_name: str, trim: bool = True) -> str:
+    """Coerce an arbitrary stem into something `_NAME_RE` accepts.
+
+    `trim=False` keeps a trailing separator (e.g. the `_` in a user-supplied
+    name prefix), so `prefix + stem` still reads as two parts.
+    """
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", (raw_name or "").strip())
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    if trim:
+        cleaned = cleaned.strip("._ ")
+    return cleaned[:64]
+
+
+def _unique_clone_name(base: str) -> str:
+    """First free clone name: `base`, then `base_1`, `base_2`, ...
+
+    Used when the name is derived from a file name, so re-registering the same
+    clip never overwrites an existing voice. Explicitly typed names are *not*
+    routed through here — a collision there is an error, not a silent rename.
+    """
+    if not _clone_path(base).exists():
+        return base
+    for index in range(1, 1000):
+        suffix = f"_{index}"
+        candidate = base[: 64 - len(suffix)] + suffix
+        if not _clone_path(candidate).exists():
+            return candidate
+    raise HTTPException(status_code=409, detail=f"名称 {base} 的可用序号已用尽")
+
+
+# --- native file picker -----------------------------------------------------
+# The browser only ever hands us a file name, so the admin page takes an
+# absolute path instead. To spare typing it, the server can raise a native
+# Windows dialog (PowerShell + WinForms — no extra Python dependency) and hand
+# the chosen path back for the page to fill in.
+_PICK_TIMEOUT = 600  # seconds; a dialog left open must not hang a worker forever
+_PICK_FILTER = (
+    "音频文件 (*.wav;*.mp3;*.flac;*.ogg;*.m4a;*.aac)|*.wav;*.mp3;*.flac;*.ogg;*.m4a;*.aac"
+    "|逐字稿 (*.txt;*.lab;*.json)|*.txt;*.lab;*.json"
+    "|所有文件 (*.*)|*.*"
+)
+
+
+def _ps_quote(value: str) -> str:
+    """Escape a value for embedding in a single-quoted PowerShell string."""
+    return (value or "").replace("'", "''")
+
+
+def _win32() -> tuple[Any, Any, Any]:
+    """(user32, kernel32, shell32) with 64-bit-safe prototypes.
+
+    ctypes defaults to 32-bit `int` for arguments without argtypes, which
+    silently truncates HWND/HMENU/HICON handles and LPARAM on x64 — the tray
+    icon's DefWindowProcW blew up with "int too long to convert" before these
+    were declared. Idempotent: prototypes are installed once per process.
+    """
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    if getattr(user32, "_omnivoice_prototypes", False):
+        return user32, kernel32, shell32
+    user32._omnivoice_prototypes = True
+
+    user32.CreateWindowExW.restype = ctypes.c_void_p
+    user32.CreateWindowExW.argtypes = [
+        ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    user32.DefWindowProcW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t
+    ]
+    user32.RegisterClassW.restype = ctypes.c_uint
+    user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+    user32.CreatePopupMenu.restype = ctypes.c_void_p
+    user32.AppendMenuW.restype = ctypes.c_int
+    user32.AppendMenuW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_wchar_p
+    ]
+    user32.GetCursorPos.restype = ctypes.c_int
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(_MSG)]
+    user32.SetForegroundWindow.restype = ctypes.c_int
+    user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+    user32.TrackPopupMenu.restype = ctypes.c_int
+    user32.TrackPopupMenu.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    user32.DestroyMenu.restype = ctypes.c_int
+    user32.DestroyMenu.argtypes = [ctypes.c_void_p]
+    user32.LoadImageW.restype = ctypes.c_void_p
+    user32.LoadImageW.argtypes = [
+        ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+    ]
+    user32.LoadIconW.restype = ctypes.c_void_p
+    user32.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.GetMessageW.argtypes = [
+        ctypes.POINTER(_MSG), ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint
+    ]
+    user32.TranslateMessage.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(_MSG)]
+    user32.DispatchMessageW.restype = ctypes.c_ssize_t
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(_MSG)]
+    user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    user32.keybd_event.argtypes = [
+        ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_uint, ctypes.c_void_p
+    ]
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.EmptyClipboard.restype = ctypes.c_int
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.CloseClipboard.restype = ctypes.c_int
+
+    kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+    kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_int
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+
+    shell32.Shell_NotifyIconW.restype = ctypes.c_int
+    shell32.Shell_NotifyIconW.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    return user32, kernel32, shell32
+
+
+def _nudge_foreground() -> None:
+    """Let a window raised by this (non-foreground) process reach the front.
+
+    Windows only lets the *foreground* process steal focus. A server process
+    popping a dialog from a worker thread therefore shows it behind whatever
+    the user is looking at — exactly the "silently sitting on the desktop"
+    symptom. Tapping and releasing ALT is the long-standing way to lift that
+    lock; a bare down/up pair has no visible side effect.
+    """
+    if os.name != "nt":
+        return
+    try:
+        user32, _, _ = _win32()
+        user32.keybd_event(0xA4, 0, 0, None)  # VK_MENU down
+        user32.keybd_event(0xA4, 0, 2, None)  # KEYEVENTF_KEYUP
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _native_pick(mode: str, title: str, initial_dir: str) -> str:
+    """Raise a native Open-file / folder dialog and return the chosen path.
+
+    Runs synchronously on a worker thread (the route is a plain `def`), so the
+    asyncio loop keeps serving while the dialog is open. The path is returned
+    base64-encoded to survive any console code page.
+    """
+    if os.name != "nt":
+        raise HTTPException(status_code=400, detail="原生选择框仅支持 Windows")
+    start = (initial_dir or "").strip()
+    if not start or not Path(start).is_dir():
+        start = str(HERE)
+
+    if mode == "dir":
+        script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.StartPosition = 'CenterScreen'
+$owner.Show()
+$owner.Activate()
+$d = New-Object System.Windows.Forms.FolderBrowserDialog
+$d.Description = '{_ps_quote(title)}'
+$d.SelectedPath = '{_ps_quote(start)}'
+$d.ShowNewFolderButton = $true
+$r = $d.ShowDialog($owner)
+$owner.Close()
+if ($r -eq [System.Windows.Forms.DialogResult]::OK) {{
+  Write-Output ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($d.SelectedPath)))
+}}
+"""
+    else:
+        script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.StartPosition = 'CenterScreen'
+$owner.Show()
+$owner.Activate()
+$d = New-Object System.Windows.Forms.OpenFileDialog
+$d.Title = '{_ps_quote(title)}'
+$d.InitialDirectory = '{_ps_quote(start)}'
+$d.Filter = '{_ps_quote(_PICK_FILTER)}'
+$d.Multiselect = $false
+$r = $d.ShowDialog($owner)
+$owner.Close()
+if ($r -eq [System.Windows.Forms.DialogResult]::OK) {{
+  Write-Output ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($d.FileName)))
+}}
+"""
+
+    # Lift Windows' foreground lock so the dialog lands in front of the browser.
+    _nudge_foreground()
+    try:
+        proc = subprocess.run(  # noqa: S603
+            ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=_PICK_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="选择框超时未操作，已关闭")
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"无法启动选择框：{error}")
+
+    out = (proc.stdout or "").strip().splitlines()
+    encoded = out[-1].strip() if out else ""
+    if not encoded:
+        return ""
+    try:
+        return base64.b64decode(encoded, validate=False).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="选择框返回内容无法解析")
+
+
+@app.post("/admin/pick-path", include_in_schema=False)
+async def admin_pick_path(request: Request) -> dict[str, Any]:
+    """Open a native dialog on the server host and return the chosen path.
+
+    Body: `{"mode": "file" | "dir", "title": "...", "initial_dir": "..."}`.
+    `initial_dir` is usually the directory of whatever is already in the path
+    box, so the dialog opens where the user left off. An empty `path` means the
+    dialog was cancelled.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    mode = str(body.get("mode") or "file").strip().lower()
+    if mode not in ("file", "dir"):
+        raise HTTPException(status_code=400, detail="mode 只能是 file 或 dir")
+    title = str(body.get("title") or "选择参考音频").strip()
+    initial_dir = str(body.get("initial_dir") or "").strip()
+
+    # Dialog owner is this process, not the browser session; run it on a worker
+    # thread so the event loop stays responsive.
+    path = await run_in_threadpool(_native_pick, mode, title, initial_dir)
+    return {"ok": True, "mode": mode, "path": path}
 
 
 @app.delete("/admin/voices/{name}", include_in_schema=False)
@@ -741,6 +1183,299 @@ async def admin_generate(request: Request):
     return entry
 
 
+# --- system tray icon -------------------------------------------------------
+# A resident icon in the notification area (bottom-right of the screen), so the
+# server is reachable without the console: left click opens the admin console,
+# right click offers "open / copy endpoint / quit". Implemented straight against
+# Shell_NotifyIcon via ctypes — pystray + Pillow would pull a wheel into the
+# self-contained runtime for something this small.
+TRAY_ENABLED = os.environ.get("OMNI_TTS_TRAY", "1") == "1"
+_TRAY_ICON_FILE = HERE / "tray.ico"
+
+_WM_TRAY = 0x0400  # WM_USER
+_WM_LBUTTONUP = 0x0202
+_WM_RBUTTONUP = 0x0205
+_NIM_ADD = 0x00000000
+_NIM_MODIFY = 0x00000001
+_NIM_DELETE = 0x00000002
+_NIF_MESSAGE = 0x00000001
+_NIF_ICON = 0x00000002
+_NIF_TIP = 0x00000004
+_TPM_RIGHTBUTTON = 0x0002
+_MF_STRING = 0x0000
+_MF_SEPARATOR = 0x0800
+_CF_UNICODETEXT = 13
+_IMAGE_ICON = 1
+_LR_LOADFROMFILE = 0x0010
+_LR_DEFAULTSIZE = 0x0040
+_IDI_APPLICATION = 32512
+
+
+def _tray_icon_bytes() -> bytes:
+    """Build a 32x32 .ico (BGRA BMP) with rounded tile + white volume bars.
+
+    Written to `tray.ico` next to this file on first run because LoadImageW
+    wants a path; the file is a runtime artifact — delete it and the icon
+    simply regenerates, so a stale copy can never outlive its generator.
+    """
+    size = 32
+    pixels = bytearray(size * size * 4)
+
+    def put(x: int, y: int, color: tuple[int, int, int]) -> None:
+        idx = ((size - 1 - y) * size + x) * 4  # BMP rows are bottom-up
+        pixels[idx : idx + 4] = bytes((color[2], color[1], color[0], 255))
+
+    radius = 7
+    for y in range(size):
+        for x in range(size):
+            corner = (radius, radius, size - 1 - radius, size - 1 - radius)
+            inside = True
+            if not (radius <= x < size - radius) and not (radius <= y < size - radius):
+                dx = max(corner[0] - x, 0, x - corner[2])
+                dy = max(corner[1] - y, 0, y - corner[3])
+                if dx * dx + dy * dy > radius * radius:
+                    inside = False
+            if not inside:
+                continue
+            t = (x + y) / (2 * size - 2)
+            put(x, y, (int(0x1B + 0x3D * t), int(0x6E + 0x3B * t), int(0xF3 + 0x0C * t)))
+    # three white bars (a little volume-meter glyph), 4px wide
+    for cx, height in ((10, 9), (15, 15), (20, 20)):
+        for x in range(cx, cx + 3):
+            for y in range(size - 6 - height, size - 5):
+                put(x, y, (255, 255, 255))
+
+    header = 40
+    pixels_offset = 22 + header
+    and_mask = b"\x00" * (size // 8 * size)  # 1bpp, all-zero = fully visible
+    payload = pixels + and_mask
+    bmp = (
+        b"".join(
+            [
+                (40).to_bytes(4, "little"),  # biSize
+                size.to_bytes(4, "little"),
+                (size * 2).to_bytes(4, "little"),  # XOR + AND rows
+                (1).to_bytes(2, "little"),  # planes
+                (32).to_bytes(2, "little"),  # bitCount
+                (0).to_bytes(4, "little"),  # compression
+                len(payload).to_bytes(4, "little"),
+                (0).to_bytes(4, "little"),
+                (0).to_bytes(4, "little"),
+                (0).to_bytes(4, "little"),
+                (0).to_bytes(4, "little"),
+            ]
+        )
+        + payload
+    )
+    ico = bytearray()
+    ico += (0).to_bytes(2, "little")  # reserved
+    ico += (1).to_bytes(2, "little")  # type: icon
+    ico += (1).to_bytes(2, "little")  # count
+    ico += bytes((size, size, 0, 0, 1, 32, len(bmp).to_bytes(4, "little")[0], 0, 0, 0, 0, 0))
+    ico += (pixels_offset).to_bytes(4, "little")
+    return bytes(ico) + bmp
+
+
+def _tray_icon_path() -> str:
+    try:
+        if not _TRAY_ICON_FILE.exists():
+            _TRAY_ICON_FILE.write_bytes(_tray_icon_bytes())
+        if _TRAY_ICON_FILE.is_file():
+            return str(_TRAY_ICON_FILE)
+    except Exception as error:  # noqa: BLE001
+        log.warning("tray icon write failed: %s", error)
+    return ""
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32),
+        ("hWnd", ctypes.c_void_p),
+        ("uID", ctypes.c_uint32),
+        ("uFlags", ctypes.c_uint32),
+        ("uCallbackMessage", ctypes.c_uint32),
+        ("hIcon", ctypes.c_void_p),
+        ("szTip", ctypes.c_wchar * 128),
+        ("dwState", ctypes.c_uint32),
+        ("dwStateMask", ctypes.c_uint32),
+        ("szInfo", ctypes.c_wchar * 256),
+        ("uVersion", ctypes.c_uint32),
+        ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", ctypes.c_uint32),
+        ("guidItem", ctypes.c_byte * 16),
+        ("hBalloonIcon", ctypes.c_void_p),
+    ]
+
+
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", ctypes.c_uint),
+        ("lpfnWndProc", ctypes.c_void_p),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p),
+        ("hCursor", ctypes.c_void_p),
+        ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p),
+    ]
+
+
+class _MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("message", ctypes.c_uint),
+        ("wParam", ctypes.c_size_t),
+        ("lParam", ctypes.c_ssize_t),
+        ("time", ctypes.c_uint),
+        ("pt_x", ctypes.c_long),
+        ("pt_y", ctypes.c_long),
+    ]
+
+
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t
+)
+_WM_DESTROY = 0x0002
+_WM_COMMAND = 0x0111
+_ID_OPEN = 1
+_ID_COPY = 2
+_ID_EXIT = 3
+
+
+def _tray_open_admin() -> None:
+    try:
+        webbrowser.open(f"http://127.0.0.1:{int(os.environ.get('OMNI_TTS_PORT', '8890'))}/admin")
+    except Exception as error:  # noqa: BLE001
+        log.warning("open admin failed: %s", error)
+
+
+def _tray_copy_endpoint() -> None:
+    url = f"http://127.0.0.1:{int(os.environ.get('OMNI_TTS_PORT', '8890'))}/v1/audio/speech"
+    try:
+        user32, kernel32, _ = _win32()
+        if not user32.OpenClipboard(None):
+            return
+        try:
+            user32.EmptyClipboard()
+            buf = ctypes.create_unicode_buffer(url)
+            handle = kernel32.GlobalAlloc(0x0042, len(buf) * 2)  # GMEM_MOVEABLE|GHND
+            locked = kernel32.GlobalLock(handle)
+            ctypes.memmove(locked, buf, len(buf) * 2)
+            kernel32.GlobalUnlock(handle)
+            user32.SetClipboardData(_CF_UNICODETEXT, handle)
+        finally:
+            user32.CloseClipboard()
+        log.info("endpoint copied to clipboard: %s", url)
+    except Exception as error:  # noqa: BLE001
+        log.warning("clipboard copy failed: %s", error)
+
+
+def _tray_thread() -> None:
+    """Own a hidden window + notification-area icon; blocks in a message loop."""
+    try:
+        user32, kernel32, shell32 = _win32()
+
+        tip = f"OmniVoice TTS · :{os.environ.get('OMNI_TTS_PORT', '8890')}（左键管理台 / 右键菜单）"
+        icon_path = _tray_icon_path()
+        hicon = None
+        if icon_path:
+            hicon = user32.LoadImageW(
+                None,
+                icon_path,
+                _IMAGE_ICON,
+                32,
+                32,
+                _LR_LOADFROMFILE | _LR_DEFAULTSIZE,
+            )
+        if not hicon:
+            hicon = user32.LoadIconW(None, _IDI_APPLICATION)
+
+        state: dict[str, Any] = {"nid": None}
+
+        def wnd_proc(hwnd, message, wparam, lparam):
+            if message == _WM_TRAY:
+                if lparam == _WM_LBUTTONUP:
+                    _tray_open_admin()
+                elif lparam == _WM_RBUTTONUP:
+                    menu = user32.CreatePopupMenu()
+                    user32.AppendMenuW(menu, _MF_STRING, _ID_OPEN, "打开管理台")
+                    user32.AppendMenuW(menu, _MF_STRING, _ID_COPY, "复制 OpenAI 端点")
+                    user32.AppendMenuW(menu, _MF_SEPARATOR, 0, None)
+                    user32.AppendMenuW(menu, _MF_STRING, _ID_EXIT, "退出服务")
+                    pt = _MSG()
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    user32.SetForegroundWindow(hwnd)
+                    user32.TrackPopupMenu(
+                        menu, _TPM_RIGHTBUTTON, pt.pt_x, pt.pt_y, 0, hwnd, None
+                    )
+                    user32.DestroyMenu(menu)
+                return 0
+            if message == _WM_COMMAND:
+                command = int(wparam) & 0xFFFF
+                if command == _ID_OPEN:
+                    _tray_open_admin()
+                elif command == _ID_COPY:
+                    _tray_copy_endpoint()
+                elif command == _ID_EXIT:
+                    log.info("quit requested from tray icon")
+                    os._exit(0)
+                return 0
+            if message == _WM_DESTROY:
+                nid = state["nid"]
+                if nid:
+                    shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid))
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+        proc = _WNDPROC(wnd_proc)  # keep a strong reference for the lifetime
+        class_name = "OmniVoiceTrayWindow"
+        wndclass = _WNDCLASSW()
+        wndclass.lpfnWndProc = ctypes.cast(proc, ctypes.c_void_p)
+        wndclass.lpszClassName = class_name
+        wndclass.hInstance = kernel32.GetModuleHandleW(None)
+        if not user32.RegisterClassW(ctypes.byref(wndclass)):
+            raise OSError(f"RegisterClassW failed: {ctypes.get_last_error()}")
+
+        hwnd = user32.CreateWindowExW(
+            0, class_name, "OmniVoice TTS", 0x80000000, 0, 0, 0, 0, None, None,
+            wndclass.hInstance, None,
+        )
+        if not hwnd:
+            raise OSError(f"CreateWindowExW failed: {ctypes.get_last_error()}")
+
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hWnd = hwnd
+        nid.uID = 1
+        nid.uFlags = _NIF_MESSAGE | _NIF_ICON | _NIF_TIP
+        nid.uCallbackMessage = _WM_TRAY
+        nid.hIcon = hicon
+        nid.szTip = tip
+        state["nid"] = nid
+        if not shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(nid)):
+            raise OSError(f"Shell_NotifyIconW failed: {ctypes.get_last_error()}")
+        log.info("tray icon ready (notification area)")
+
+        msg = _MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+    except Exception as error:  # noqa: BLE001
+        # Never let the tray take the server down: log and move on.
+        log.warning("tray icon disabled: %s", error)
+
+
+def start_tray() -> None:
+    """Start the notification-area icon on a daemon thread (Windows only)."""
+    if not TRAY_ENABLED or os.name != "nt":
+        return
+    thread = threading.Thread(target=_tray_thread, name="omnivoice-tray", daemon=True)
+    thread.start()
+
+
 def main() -> None:
     port = int(os.environ.get("OMNI_TTS_PORT", "8890"))
     host = os.environ.get("OMNI_TTS_HOST", "127.0.0.1")
@@ -753,6 +1488,7 @@ def main() -> None:
     log.info("admin console: http://%s:%d/admin", host, port)
     log.info("history archive: %s", HISTORY_DIR)
     log.info("cloned voices: %s (%d stored)", CLONE_DIR, len(clone_names()))
+    start_tray()
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 

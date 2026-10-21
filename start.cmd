@@ -12,6 +12,7 @@ rem bfloat16 = lossless w.r.t. fp16 quality-wise for this model, ~2GB VRAM.
 if not defined OMNIVOICE_DTYPE set "OMNIVOICE_DTYPE=bfloat16"
 if not defined OMNIVOICE_MODEL set "OMNIVOICE_MODEL=%~dp0models\OmniVoice"
 if not defined OMNIVOICE_DEVICE set "OMNIVOICE_DEVICE=cuda:0"
+rem Port / host.
 if not defined OMNI_TTS_PORT set "OMNI_TTS_PORT=8890"
 if not defined OMNI_TTS_HOST set "OMNI_TTS_HOST=127.0.0.1"
 

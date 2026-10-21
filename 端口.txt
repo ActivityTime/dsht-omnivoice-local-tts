@@ -1,0 +1,4 @@
+管理台（前端）：http://127.0.0.1:8890/admin
+OpenAI 兼容端点：http://127.0.0.1:8890/v1/audio/speech
+健康检查：http://127.0.0.1:8890/health
+端口由 server.py:745 的 OMNI_TTS_PORT 决定，默认 8890（改环境变量可换）。
