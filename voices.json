@@ -1,0 +1,13 @@
+{
+  "alloy": "female, young adult, moderate pitch",
+  "ash": "male, young adult, low pitch",
+  "ballad": "male, middle-aged, low pitch",
+  "coral": "female, young adult, high pitch",
+  "echo": "male, young adult, moderate pitch",
+  "fable": "female, middle-aged, moderate pitch, british accent",
+  "nova": "female, young adult, high pitch",
+  "onyx": "male, elderly, very low pitch",
+  "sage": "female, middle-aged, moderate pitch",
+  "shimmer": "female, young adult, high pitch, whisper",
+  "verse": "male, middle-aged, moderate pitch"
+}

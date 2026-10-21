@@ -1,0 +1,14 @@
+# OmniVoice 本地 TTS 服务依赖（顶层，传递依赖由 pip 自动解析）
+# 注：torch / torchaudio 为 PyTorch CUDA 12.8 专用构建，需配合 PyTorch 源安装：
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+omnivoice==0.2.1
+fastapi
+uvicorn
+lameenc
+soundfile
+numpy
+transformers
+huggingface_hub
+pefile
