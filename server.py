@@ -74,6 +74,7 @@ os.environ.setdefault("HF_HOME", str(HERE / "hf"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HERE / "hf" / "hub"))
 
 from fastapi import FastAPI, Header, HTTPException, Request  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import HTMLResponse, JSONResponse, Response  # noqa: E402
 import uvicorn  # noqa: E402
 
@@ -299,6 +300,11 @@ def save_record(fields: dict[str, Any], payload: bytes | None, ext: str) -> dict
 
 
 app = FastAPI(title="OmniVoice OpenAI-compatible TTS", version="1.0.0")
+# Permissive CORS: the console is also usable by opening admin.html straight
+# from disk (file://), and everything here is a loopback-only local service.
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
 
 
 def check_auth(authorization: str | None) -> None:
