@@ -1,0 +1,22 @@
+# ===== 运行时环境（体积大，由 setup 脚本在本机重建，不入库）=====
+/python/
+/venv/
+/pip-cache/
+/scratch/
+
+# ===== 模型权重（3.1GB，由 download_model.py 拉取，不入库）=====
+/models/
+
+# ===== 运行产物 =====
+server.log
+*.mp3
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 系统 / 编辑器 =====
+Thumbs.db
+ehthumbs.db
+.DS_Store
+.vscode/
+.idea/
