@@ -31,3 +31,6 @@ ehthumbs.db
 .DS_Store
 .vscode/
 .idea/
+
+# ===== 本地随手笔记（端点速查等，非项目文档）=====
+/端口.txt
