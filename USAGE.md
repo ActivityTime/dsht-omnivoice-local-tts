@@ -28,17 +28,17 @@ OmniVoice（k2-fsa / 小米 Next-gen Kaldi 开源 TTS，~0.6B 参数，扩散语
 
 | 路径 | 用途 | 是否必需 | 体积 |
 |---|---|---|---|
-| `server.py` | 服务主程序（FastAPI + uvicorn） | ✅ 必需 | ~14 KB |
+| `server.py` | 服务主程序（FastAPI + uvicorn） | ✅ 必需 | ~20 KB |
+| `admin.html` | 管理控制台页面（自包含单文件，无 CDN） | ✅ 必需 | ~15 KB |
 | `start.cmd` | Windows 启动器，双击即起 | ✅ 必需 | <1 KB |
 | `voices.json` | 11 个音色 → 文字造声属性映射 | ✅ 必需 | <1 KB |
 | `models/OmniVoice/` | 模型权重（见 §2.1） | ✅ 必需 | **3.1 GB** |
-| `venv/` | Python 虚拟环境（torch 2.8+cu128 等） | ✅ 必需 | 16.4 GB（含残留，见 §6） |
-| `wheels/` | 离线安装用 wheel（torch/torchaudio 2.8 与 2.11 各一份） | 可选 | 5.9 GB |
-| `hf/` | HuggingFace 缓存目录（运行时**未**走此路径） | 可选/可清 | 3.1 GB |
+| `python/` | 内置 embeddable CPython 3.13 运行时 + 全部依赖 | ✅ 必需 | ~7 GB |
+| `history/` | 管理台请求归档（见 §3.5），运行时生成 | 产物 | 随使用增长 |
 | `download_model.py` | 从 hf-mirror 拉取模型权重的脚本 | 可选 | <1 KB |
 | `server.log` | 运行日志（启动后生成） | 产物 | 随运行增长 |
 | `test_out.mp3` / `test_out2.mp3` | 验证用生成产物 | 产物 | ~50/28 KB |
-| `scratch/` | 调试/遗留脚本与缓存归档（见 §6） | 否 | — |
+| `scratch/` | 调试/遗留脚本与缓存归档（含 `wheels/`、`hf/`，见 §6） | 否 | — |
 | `README_upstream.md` / `voice-design_upstream.md` | 上游官方文档副本 | 参考 | — |
 
 ### 2.1 模型权重明细（`models/OmniVoice/`）
@@ -65,7 +65,7 @@ OmniVoice（k2-fsa / 小米 Next-gen Kaldi 开源 TTS，~0.6B 参数，扩散语
 ### 3.2 后台启动（无窗口、日志落盘）
 ```bat
 cd /d "K:\OmniVoice"
-venv\Scripts\python.exe server.py > server.log 2>&1
+python\python.exe server.py > server.log 2>&1
 ```
 > 关掉窗口它就停。要长期开机自启，见 `OmniVoice部署调研.md` 第八节（NSSM / 启动项）。
 
@@ -81,13 +81,50 @@ venv\Scripts\python.exe server.py > server.log 2>&1
 | `OMNI_TTS_HOST` | `127.0.0.1` | 监听地址（改 `0.0.0.0` 可局域网共享） |
 | `OMNI_TTS_KEY` | 空 | 鉴权密钥；空 = 不校验（DSHT 留空即可） |
 | `OMNI_TTS_VOICES` | `voices.json` | 音色映射文件 |
-| `OMNI_TTS_USE_INSTRUCTIONS` | `0` | 是否启用 `instructions` 字段 |
+| `OMNI_TTS_USE_INSTRUCTIONS` | `0` | 管理台「附加属性」开关的默认值 |
+| `OMNI_TTS_HISTORY_DIR` | `history/` | 管理台请求归档目录 |
+| `OMNI_TTS_LOG_API` | `0` | 是否也归档 OpenAI 端点（`/v1/audio/speech`）的请求；DSHT 逐条调用会持续写盘，默认关 |
+| `OMNI_TTS_ADMIN_PAGE` | `admin.html` | 管理台页面文件位置 |
 
 ### 3.4 健康检查
 ```bat
 curl http://127.0.0.1:8890/health
 # => {"status":"ok","loaded":true,"device":"cuda:0","cuda":true,...}
 ```
+
+### 3.5 管理控制台
+
+浏览器打开 **http://127.0.0.1:8890/admin**（页面每次请求读盘，改 `admin.html` 后刷新即可生效，无需重启服务）。
+
+**能做什么**
+
+1. **自定义参数发起请求** —— 文本、声音/属性描述、附加属性、语速 `speed`（0.25–4）、扩散步数
+   `num_step`（1–100）、输出格式 `mp3`/`wav`、是否把附加属性拼入属性串。
+2. **属性速选** —— 内置 OmniVoice 合法属性项（英文 23 项 / 中文 25 项），点选即按正确分隔符拼装
+   （英文 `, `、中文 `，`）；切换语言时自动重置，避免中英混用被模型拒绝。
+3. **请求与产出归档** —— 每次请求（**含失败**）写入 `history/<id>/`：
+   - `meta.json`：完整入参、解析后的属性串、语速、步数、格式、耗时 `elapsed_ms`、字节数、状态、错误信息；
+   - `audio.mp3` / `audio.wav`：实际音频产出。
+4. **回看与复用** —— 列表内直接试听、下载、把历史参数一键回填表单重跑、单条删除或清空全部；顶部显示
+   总条数/成功/失败/累计产出体积。
+
+**属性填写规则（模型侧强校验，踩过坑）**
+
+- 属性项只能来自 OmniVoice 的合法清单，**不支持情绪词**（如「开心」「激动」会直接报错）。
+- **不可中英混用**：要么全英文（`male, british accent`），要么全中文且用全角逗号（`男，河南话`）。
+- 失败不会被静默吞掉：错误会连同完整入参一起归档，并在列表里以红色展示原始报错。
+
+**相关端点**（均以 JSON 交互，可脚本化调用）
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/admin` | 控制台页面 |
+| POST | `/admin/generate` | 自定义参数合成并归档 |
+| GET | `/admin/history?limit=50` | 记录列表 + 统计 |
+| GET | `/admin/history/{id}` | 单条详情（供复用参数） |
+| DELETE | `/admin/history/{id}` | 删除单条（含音频） |
+| DELETE | `/admin/history` | 清空全部归档 |
+| GET | `/admin/audio/{id}?download=1` | 回放 / 下载产出音频 |
 
 ---
 

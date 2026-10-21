@@ -31,6 +31,20 @@ DSHT 配音配置：
 | 声音列表 | `alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer, verse` |
 | 默认声音 | `alloy` 走映射；或填 `female, elderly, 四川话` 触发文字造声 |
 
+## 管理控制台
+
+服务启动后打开 **http://127.0.0.1:8890/admin** —— 一个自包含的单文件页面（无 CDN、离线可用）：
+
+- **自定义参数发起请求**：文本、声音/属性描述、附加属性、语速 `speed`、扩散步数 `num_step`、输出格式
+  `mp3`/`wav`、是否附加属性；内置**属性速选标签**（英文 23 项 / 中文 25 项），点选自动按正确分隔符拼装，
+  避免中英混用被模型拒绝。
+- **请求与产出全量归档**：每次请求（含失败）写入 `history/<id>/`，含 `meta.json`（完整参数、耗时、字节数、
+  错误信息）与实际音频文件，页面内可直接试听、下载、复用参数、单条删除或清空。
+- 顶部实时显示模型加载状态、设备、dtype、CUDA。
+
+> OpenAI 端点（`/v1/audio/speech`，即 DSHT 走的那条）默认**不写归档**，避免聊天逐条刷盘；
+> 需要时也记录可设环境变量 `OMNI_TTS_LOG_API=1`。
+
 详细使用、排障、各资源位置见 [`USAGE.md`](./USAGE.md)。
 
 ## 自举（全新机器 / 从 git 克隆后）
@@ -55,6 +69,7 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 | 路径 | 说明 | 入 git |
 |---|---|---|
 | `server.py` | FastAPI OpenAI 兼容 TTS 服务 | ✅ |
+| `admin.html` | 管理控制台页面（自包含，无外链） | ✅ |
 | `start.cmd` | Windows 启动器 | ✅ |
 | `voices.json` | 音色 → 文字造声属性映射 | ✅ |
 | `download_model.py` | 从 hf-mirror 拉取模型 | ✅ |
@@ -63,6 +78,7 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 | `USAGE.md` | 完整使用与部署文档 | ✅ |
 | `python/` | 内置 embeddable Python 运行时 | ❌（体积大） |
 | `models/` | OmniVoice 模型权重（3.1 GB） | ❌（体积大） |
+| `history/` | 管理台请求归档（参数 + 音频产出，运行时生成） | ❌ |
 | `scratch/` | 调试/遗留归档 | ❌ |
 
 ## 许可

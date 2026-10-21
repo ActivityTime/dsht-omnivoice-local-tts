@@ -22,8 +22,13 @@ import io
 import json
 import logging
 import os
+import re
+import shutil
 import sys
 import threading
+import time
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +74,7 @@ os.environ.setdefault("HF_HOME", str(HERE / "hf"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HERE / "hf" / "hub"))
 
 from fastapi import FastAPI, Header, HTTPException, Request  # noqa: E402
-from fastapi.responses import JSONResponse, Response  # noqa: E402
+from fastapi.responses import HTMLResponse, JSONResponse, Response  # noqa: E402
 import uvicorn  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -88,6 +93,16 @@ VOICES_FILE = Path(os.environ.get("OMNI_TTS_VOICES", HERE / "voices.json"))
 # contains "gpt-4o". OmniVoice's design attributes have no emotion axis, so by
 # default the phrase is ignored; set this to 1 to append it to the instruct.
 USE_INSTRUCTIONS = os.environ.get("OMNI_TTS_USE_INSTRUCTIONS", "0") == "1"
+
+# --- request history (admin console) ----------------------------------------
+# Each request made through the admin console is persisted as a directory
+# holding meta.json plus the decoded audio, so runs can be replayed later.
+HISTORY_DIR = Path(os.environ.get("OMNI_TTS_HISTORY_DIR", HERE / "history"))
+ADMIN_FILE = Path(os.environ.get("OMNI_TTS_ADMIN_PAGE", HERE / "admin.html"))
+# Requests arriving on the OpenAI endpoint are only logged when enabled: DSH
+# Tavern can fire one per message bubble and would fill the disk.
+LOG_API = os.environ.get("OMNI_TTS_LOG_API", "0") == "1"
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 SAMPLE_RATE = 24000
 MAX_TEXT = 4000
@@ -192,16 +207,95 @@ AUDIO_FORMATS = {
 }
 
 
-def pick_instruct(voice: str, instructions: str, voices: dict[str, str]) -> str:
+def pick_instruct(
+    voice: str,
+    instructions: str,
+    voices: dict[str, str],
+    use_instructions: bool | None = None,
+) -> str:
     key = (voice or "").strip()
     instruct = voices.get(key, voices.get(key.lower(), ""))
     if not instruct:
         # Not one of the known names: treat the value itself as a design string,
         # so "female, elderly, 四川话" works straight from the voice field.
         instruct = key
-    if USE_INSTRUCTIONS and instructions:
+    merge = USE_INSTRUCTIONS if use_instructions is None else use_instructions
+    if merge and instructions:
         instruct = f"{instruct}, {instructions}" if instruct else instructions
     return instruct.strip(" ,，")
+
+
+def run_generate(
+    *, text: str, instruct: str, speed: float, num_step: int, fmt: str
+) -> tuple[bytes, str]:
+    """Shared decode path for the OpenAI endpoint and the admin console."""
+    model = get_model()
+    with _state["lock"]:
+        chunks = model.generate(
+            text=text, instruct=instruct or None, speed=speed, num_step=num_step
+        )
+    if not chunks:
+        raise RuntimeError("model returned no audio")
+    samples = chunks[0] if isinstance(chunks, (list, tuple)) else chunks
+    media_type, encoder = AUDIO_FORMATS[fmt]
+    return bytes(encoder(np.asarray(samples, dtype=np.float32))), media_type
+
+
+def _history_dir(rid: str) -> Path:
+    if not _ID_RE.match(rid or ""):
+        raise HTTPException(status_code=400, detail="bad record id")
+    return HISTORY_DIR / rid
+
+
+def _read_meta(directory: Path) -> dict[str, Any] | None:
+    meta = directory / "meta.json"
+    if not meta.exists():
+        return None
+    try:
+        rec = json.loads(meta.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    rec.setdefault("id", directory.name)
+    return rec
+
+
+def _all_records() -> list[dict[str, Any]]:
+    """Every stored record, newest first (by directory mtime)."""
+    if not HISTORY_DIR.exists():
+        return []
+    stamped: list[tuple[float, dict[str, Any]]] = []
+    for directory in HISTORY_DIR.iterdir():
+        if not directory.is_dir():
+            continue
+        rec = _read_meta(directory)
+        if rec is None:
+            continue
+        if rec.get("audio_file") and (directory / rec["audio_file"]).exists():
+            ext = Path(rec["audio_file"]).suffix.lstrip(".") or "mp3"
+            rec["audio_url"] = f"/admin/audio/{rec['id']}?ext={ext}"
+        stamped.append((directory.stat().st_mtime, rec))
+    stamped.sort(key=lambda pair: pair[0], reverse=True)
+    return [rec for _, rec in stamped]
+
+
+def save_record(fields: dict[str, Any], payload: bytes | None, ext: str) -> dict[str, Any]:
+    """Persist one request + its audio output under history/<id>/."""
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    rid = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    entry = dict(fields)
+    entry["id"] = rid
+    entry["time"] = datetime.now().isoformat(timespec="seconds")
+    entry["status"] = "ok" if payload else "error"
+    directory = HISTORY_DIR / rid
+    directory.mkdir(parents=True, exist_ok=True)
+    if payload:
+        (directory / f"audio.{ext}").write_bytes(payload)
+        entry["audio_file"] = f"audio.{ext}"
+        entry["bytes"] = len(payload)
+    (directory / "meta.json").write_text(
+        json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return entry
 
 
 app = FastAPI(title="OmniVoice OpenAI-compatible TTS", version="1.0.0")
@@ -266,28 +360,187 @@ async def speech(request: Request, authorization: str | None = Header(default=No
         speed = 1.0
 
     instruct = pick_instruct(voice, instructions, load_voices())
-    model = get_model()
+    started = time.perf_counter()
 
-    with _state["lock"]:
-        try:
-            chunks = model.generate(
-                text=text,
-                instruct=instruct or None,
-                speed=speed,
-                num_step=NUM_STEP,
-            )
-        except Exception as error:  # noqa: BLE001
-            log.exception("generation failed")
-            return JSONResponse({"error": {"message": f"generation failed: {error}"}}, status_code=500)
+    try:
+        payload, media_type = run_generate(
+            text=text, instruct=instruct, speed=speed, num_step=NUM_STEP, fmt=fmt
+        )
+    except Exception as error:  # noqa: BLE001
+        log.exception("generation failed")
+        if LOG_API:
+            try:
+                save_record(
+                    {
+                        "source": "api",
+                        "text": text,
+                        "voice": voice,
+                        "instruct": instruct,
+                        "speed": speed,
+                        "num_step": NUM_STEP,
+                        "format": fmt,
+                        "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                        "error": str(error),
+                    },
+                    None,
+                    fmt,
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("failed to persist error record")
+        return JSONResponse({"error": {"message": f"generation failed: {error}"}}, status_code=500)
 
-    if not chunks:
-        return JSONResponse({"error": {"message": "model returned no audio"}}, status_code=500)
-
-    samples = chunks[0] if isinstance(chunks, (list, tuple)) else chunks
-    media_type, encoder = AUDIO_FORMATS[fmt]
-    payload = bytes(encoder(np.asarray(samples, dtype=np.float32)))
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
     log.info("tts ok: %d chars, voice=%r, instruct=%r, %d bytes %s", len(text), voice, instruct, len(payload), fmt)
+
+    if LOG_API:
+        try:
+            save_record(
+                {
+                    "source": "api",
+                    "text": text,
+                    "voice": voice,
+                    "instruct": instruct,
+                    "speed": speed,
+                    "num_step": NUM_STEP,
+                    "format": fmt,
+                    "elapsed_ms": elapsed_ms,
+                },
+                payload,
+                fmt,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("failed to persist api record")
     return Response(content=payload, media_type=media_type)
+
+
+# --- admin console ----------------------------------------------------------
+# A single self-contained page (no CDN, no build step) plus the JSON API it
+# talks to. Every request made here is archived under history/<id>/ with the
+# decoded audio so runs can be replayed, downloaded or audited afterwards.
+
+
+@app.get("/admin", include_in_schema=False)
+def admin_page():
+    if not ADMIN_FILE.exists():
+        return HTMLResponse("<h1>admin.html not found next to server.py</h1>", status_code=500)
+    return HTMLResponse(ADMIN_FILE.read_text(encoding="utf-8"))
+
+
+@app.get("/admin/history", include_in_schema=False)
+def admin_history(limit: int = 50) -> dict[str, Any]:
+    records = _all_records()
+    return {
+        "items": records[: max(1, min(limit, 500))],
+        "total": len(records),
+        "ok": sum(1 for r in records if r.get("status") == "ok"),
+        "failed": sum(1 for r in records if r.get("status") != "ok"),
+        "bytes_total": sum(int(r.get("bytes") or 0) for r in records),
+    }
+
+
+@app.get("/admin/history/{rid}", include_in_schema=False)
+def admin_get_record(rid: str) -> dict[str, Any]:
+    rec = _read_meta(_history_dir(rid))
+    if rec is None:
+        raise HTTPException(status_code=404, detail="record not found")
+    return rec
+
+
+@app.delete("/admin/history/{rid}", include_in_schema=False)
+def admin_delete_record(rid: str) -> dict[str, Any]:
+    directory = _history_dir(rid)
+    if not directory.exists():
+        raise HTTPException(status_code=404, detail="record not found")
+    shutil.rmtree(directory, ignore_errors=True)
+    return {"ok": True}
+
+
+@app.delete("/admin/history", include_in_schema=False)
+def admin_clear_history() -> dict[str, Any]:
+    if HISTORY_DIR.exists():
+        shutil.rmtree(HISTORY_DIR, ignore_errors=True)
+    return {"ok": True}
+
+
+@app.get("/admin/audio/{rid}", include_in_schema=False)
+def admin_audio(rid: str, download: int = 0):
+    directory = _history_dir(rid)
+    rec = _read_meta(directory)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="record not found")
+    name = rec.get("audio_file")
+    if not name or not (directory / name).exists():
+        raise HTTPException(status_code=404, detail="record has no audio")
+    fmt = Path(name).suffix.lstrip(".").lower() or "mp3"
+    media_type = AUDIO_FORMATS.get(fmt, AUDIO_FORMATS["mp3"])[0]
+    headers = {"Content-Disposition": f'attachment; filename="{rid}.{fmt}"'} if download else {}
+    return Response(content=(directory / name).read_bytes(), media_type=media_type, headers=headers)
+
+
+@app.post("/admin/generate", include_in_schema=False)
+async def admin_generate(request: Request):
+    """Console-initiated synthesis: arbitrary params, always archived."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    text = str(body.get("input") or body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"status": "error", "error": "input is empty"}, status_code=400)
+    if len(text) > MAX_TEXT:
+        text = text[:MAX_TEXT]
+
+    voice = str(body.get("voice") or "alloy")
+    instructions = str(body.get("instructions") or "")
+    fmt = str(body.get("response_format") or "mp3").lower()
+    if fmt not in AUDIO_FORMATS:
+        fmt = "mp3"
+    use_instr = bool(body.get("use_instructions", USE_INSTRUCTIONS))
+
+    try:
+        speed = float(body.get("speed") or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+    speed = max(0.25, min(4.0, speed))
+    try:
+        num_step = int(body.get("num_step") or NUM_STEP)
+    except (TypeError, ValueError):
+        num_step = NUM_STEP
+    num_step = max(1, min(100, num_step))
+
+    instruct = pick_instruct(voice, instructions, load_voices(), use_instr)
+    fields: dict[str, Any] = {
+        "source": "admin",
+        "text": text,
+        "voice": voice,
+        "instructions": instructions,
+        "instruct": instruct,
+        "use_instructions": use_instr,
+        "speed": speed,
+        "num_step": num_step,
+        "format": fmt,
+    }
+
+    started = time.perf_counter()
+    try:
+        payload, _ = run_generate(
+            text=text, instruct=instruct, speed=speed, num_step=num_step, fmt=fmt
+        )
+    except Exception as error:  # noqa: BLE001
+        log.exception("admin generation failed")
+        entry = save_record(
+            dict(fields, elapsed_ms=int((time.perf_counter() - started) * 1000), error=str(error)),
+            None,
+            fmt,
+        )
+        return JSONResponse({"status": "error", "id": entry["id"], "error": str(error)}, status_code=500)
+
+    entry = save_record(dict(fields, elapsed_ms=int((time.perf_counter() - started) * 1000)), payload, fmt)
+    entry["audio_url"] = f"/admin/audio/{entry['id']}?ext={fmt}"
+    return entry
 
 
 def main() -> None:
@@ -299,6 +552,8 @@ def main() -> None:
         log.error("model load failed: %s", error)
         sys.exit(1)
     log.info("listening on http://%s:%d", host, port)
+    log.info("admin console: http://%s:%d/admin", host, port)
+    log.info("history archive: %s", HISTORY_DIR)
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
