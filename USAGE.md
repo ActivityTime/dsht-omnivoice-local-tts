@@ -78,6 +78,17 @@ python\python.exe server.py > server.log 2>&1
 | `OMNIVOICE_DEVICE` | `cuda:0` | 设备；CPU 用 `cpu`（极慢） |
 | `OMNIVOICE_DTYPE` | `bfloat16` | `bfloat16` / `float16` / `float32` |
 | `OMNIVOICE_NUM_STEP` | `32` | 扩散步数，越大越慢越细 |
+| `OMNIVOICE_GUIDANCE_SCALE` | `2.0` | 生成默认：引导强度（0–20） |
+| `OMNIVOICE_T_SHIFT` | `0.1` | 生成默认：时间步偏移（0–1，小=强调低 SNR） |
+| `OMNIVOICE_LAYER_PENALTY_FACTOR` | `5.0` | 生成默认：层惩罚因子（0–50，促使靠前 codebook 层先解码） |
+| `OMNIVOICE_POSITION_TEMPERATURE` | `5.0` | 生成默认：位置选择温度（0.01–50） |
+| `OMNIVOICE_CLASS_TEMPERATURE` | `0.0` | 生成默认：token 采样温度（0–10，0=贪心确定性） |
+| `OMNIVOICE_DENOISE` | `1` | 生成默认：是否加 `<|denoise|>` 令牌 |
+| `OMNIVOICE_POSTPROCESS_OUTPUT` | `1` | 生成默认：后处理（剪 >0.5s 句中静音 / 淡入淡出 / 边距静音） |
+| `OMNIVOICE_PAD_DURATION` | `0.1` | 生成默认：边距静音秒数（0–2，0=不加） |
+| `OMNIVOICE_FADE_DURATION` | `0.1` | 生成默认：淡入淡出秒数（0–2，0=不淡入淡出） |
+| `OMNIVOICE_AUDIO_CHUNK_DURATION` | `15` | 生成默认：长文本分块时长（秒，1–60，块间交叉淡化） |
+| `OMNIVOICE_AUDIO_CHUNK_THRESHOLD` | `30` | 生成默认：预估音频超此秒数才分块（1–300） |
 | `OMNI_TTS_PORT` | `8890` | 监听端口 |
 | `OMNI_TTS_HOST` | `127.0.0.1` | 监听地址（改 `0.0.0.0` 可局域网共享） |
 | `OMNI_TTS_KEY` | 空 | 鉴权密钥；空 = 不校验（DSHT 留空即可） |
@@ -102,11 +113,16 @@ curl http://127.0.0.1:8890/health
 **能做什么**
 
 1. **自定义参数发起请求** —— 文本、声音/属性描述、附加属性、语速 `speed`（0.25–4）、扩散步数
-   `num_step`（1–100）、输出格式 `mp3`/`wav`、是否把附加属性拼入属性串。
+   `num_step`（1–100）、输出格式 `mp3`/`wav`/`flac`/`opus`/`pcm`、是否把附加属性拼入属性串。
+2. **高级参数折叠区** —— `OmniVoiceGenerationConfig` 全字段（见 §3.8 参数表）：语言 `language`
+   （带 646 项自动补全）、固定时长 `duration`、`guidance_scale`、`t_shift`、`layer_penalty_factor`、
+   `position_temperature`、`class_temperature`、`pad_duration`、`fade_duration`、`audio_chunk_duration`、
+   `audio_chunk_threshold`、`denoise`、`postprocess_output`、`normalize_text`。输入框默认值由
+   `/health` 的 `gen_defaults` 下发（即上表环境变量的实时值），不留静态副本。
 2. **属性速选** —— 内置 OmniVoice 合法属性项（英文 23 项 / 中文 25 项），点选即按正确分隔符拼装
    （英文 `, `、中文 `，`）；切换语言时自动重置，避免中英混用被模型拒绝。
 3. **请求与产出归档** —— 每次请求（**含失败**）写入 `history/<id>/`：
-   - `meta.json`：完整入参、解析后的属性串、语速、步数、格式、耗时 `elapsed_ms`、字节数、状态、错误信息；
+   - `meta.json`：完整入参、解析后的属性串、语速、步数、格式、`gen_params`（偏离默认值的高级参数）、耗时 `elapsed_ms`、字节数、状态、错误信息；
    - `audio.mp3` / `audio.wav`：实际音频产出。
 4. **回看与复用** —— 列表内直接试听、下载、把历史参数一键回填表单重跑、单条删除或清空全部；顶部显示
    总条数/成功/失败/累计产出体积。
@@ -128,6 +144,7 @@ curl http://127.0.0.1:8890/health
 | DELETE | `/admin/history/{id}` | 删除单条（含音频） |
 | DELETE | `/admin/history` | 清空全部归档 |
 | GET | `/admin/audio/{id}?download=1` | 回放 / 下载产出音频 |
+| GET | `/admin/languages` | 模型 646 种语言表（`ids` + `names`），供 `language` 自动补全 |
 
 ---
 
@@ -182,22 +199,76 @@ curl http://127.0.0.1:8890/health
 | 文件 | 内容 |
 |---|---|
 | `<name>.pt` | `VoiceClonePrompt.save()` 产物，约 7 KB（音频已 token 化，极小） |
-| `<name>.json` | 元信息：`ref_text`、时长、采样率、来源文件名、创建时间 |
+| `<name>.json` | 元信息：`ref_text`、时长、采样率、来源文件名、`preprocess_prompt`、创建时间 |
 | `<name>.ref<ext>` | 原始参考音频，供页面回听 |
 
 进程内另有 `dict` 缓存已加载的 prompt，命中即不再读盘；**服务重启不丢失**（落在磁盘上）。
 
+**`preprocess_prompt`（默认开）**
+
+OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的静音、超 20s 的按最大静音间隙切短、
+逐字稿末尾补一个句末标点。管理台克隆卡片有勾选框；关掉（`preprocess_prompt=0`）= 原样嵌入，
+仅用于逐字稿已带标点且静音本身有意义的场景。生成端点不暴露此字段——我们恒走预建好的
+`voice_clone_prompt`，该字段只在建 prompt 时起作用。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/voices` | 音色库列表（只读元信息，不加载 prompt） |
-| POST | `/admin/voices` | `name`（可空）+ `local_path`（服务端读盘，`ref_text` 可留空）；`audio` 上传字段仍兼容（`ref_text` 必填） |
-| POST | `/admin/import-local` | `path`（目录或文件）+ `prefix` + `limit`：批量注册，逐字稿取音频同目录同名文本 |
+| POST | `/admin/voices` | `name`（可空）+ `local_path`（服务端读盘，`ref_text` 可留空）+ `preprocess_prompt`（`"1"`/`"0"`，默认 `"1"`）；`audio` 上传字段仍兼容（`ref_text` 必填） |
+| POST | `/admin/import-local` | `path`（目录或文件）+ `prefix` + `limit` + `preprocess_prompt`：批量注册，逐字稿取音频同目录同名文本 |
 | POST | `/admin/pick-path` | `{"mode":"file"|"dir","title","initial_dir"}`：服务端弹原生选择框，返回选中路径（空=取消） |
 | DELETE | `/admin/voices/{name}` | 删除音色及其参考音频 |
 | GET | `/admin/voices/{name}/audio` | 回听原始参考音频 |
 
 > 两种模式**互斥**：`voice` 命中克隆音色时，属性串不再参与生成（音色已由参考音频决定）。
 > DSHT 侧无感——voice 字段填克隆音色名即可，走的还是同一个 OpenAI 端点。
+
+### 3.8 OpenAI 端点请求参数全表（`POST /v1/audio/speech`）
+
+除 OpenAI 标准字段外，OmniVoice 的 `OmniVoiceGenerationConfig` 全字段 + `language` / `duration` /
+`normalize_text` 均可按请求覆盖。缺省值即 §3.3 环境变量（`/health` 的 `gen_defaults` 可查实时值）。
+
+| 字段 | 类型 | 默认 | 范围 / 取值 | 说明 |
+|---|---|---|---|---|
+| `input`（或 `text`） | str | — | 必填，≤4000 字 | 要合成的文本 |
+| `voice` | str | `alloy` | 预设名 / 属性串 / 克隆音色名 | 见 §3.7 与 §4 |
+| `instructions` | str | 空 | OmniVoice 合法属性项 | 需 `use_instructions` 或模型名含 gpt-4o 才拼入 |
+| `response_format` | str | `mp3` | `mp3` `wav` `pcm` `flac` `opus` | 未知值返回 **400**（列出合法值），不静默回落 |
+| `speed` | num | `1.0` | 0.25–4 | 语速倍率 |
+| `num_step` | int | `32` | 1–100 | 扩散步数 |
+| `language` | str | 空 | ISO 代码 / 英文名称 / `auto` / 空 | 空=语言无关模式（中英混说用它）；`auto` 按文本猜（kana→ja、hangul→ko、汉字→zh、西里尔→ru、其余→en）；无法识别返回 400 |
+| `duration` | num | 空 | 0.05–600 | 固定输出秒数，**覆盖 speed**；空=按文本估计 |
+| `normalize_text` | bool | `false` | — | 数字/日期/货币转读法。**本机未装 WeTextProcessing/num2words，勾选返回 400**，不会静默跳过 |
+| `guidance_scale` | num | `2.0` | 0–20 | 分类器自由引导强度 |
+| `t_shift` | num | `0.1` | 0–1 | 时间步偏移 |
+| `layer_penalty_factor` | num | `5.0` | 0–50 | 层惩罚因子 |
+| `position_temperature` | num | `5.0` | 0.01–50 | 位置选择温度 |
+| `class_temperature` | num | `0.0` | 0–10 | token 采样温度（0=贪心） |
+| `denoise` | bool | `true` | — | 是否加 `<|denoise|>` 令牌 |
+| `postprocess_output` | bool | `true` | — | 剪 >0.5s 句中静音 / 淡入淡出 / 边距静音 |
+| `pad_duration` | num | `0.1` | 0–2 | 边距静音秒数 |
+| `fade_duration` | num | `0.1` | 0–2 | 淡入淡出秒数 |
+| `audio_chunk_duration` | num | `15` | 1–60 | 长文本分块时长（秒） |
+| `audio_chunk_threshold` | num | `30` | 1–300 | 预估超此秒数才分块 |
+
+**输出格式说明**
+
+| 值 | 容器 / 编码 | 备注 |
+|---|---|---|
+| `mp3` | MPEG Layer III（lameenc，64 kbps） | 体积最小，DSHT 默认 |
+| `wav` | WAV / PCM 16-bit | 无损，兼容性最好 |
+| `flac` | FLAC / PCM 16-bit | 无损压缩 |
+| `opus` | **OGG 容器** + Opus | libsndfile 无裸 Opus 复用器，媒体类型是 `audio/ogg` |
+| `pcm` | **裸 PCM** 16-bit 小端单声道 24 kHz | 无容器无文件头，OpenAI `pcm` 语义 |
+
+> 不支持 AAC——libsndfile 不写 AAC。（旧版把 flac/opus/aac 全落 WAV 是假支持，已修。）
+
+**文本处理要点**（标点不会丢，但会被规范化）
+
+- 全角括号转半角、压缩空白、去汉字两侧空格；克隆模式 `ref_text + " " + text` 拼接。
+- 中文标点走 byte-level fallback（模型侧保留），ASCII 标点有专属 token；标点影响时长估计（权重 0.5）。
+- 支持 14 个非语言标签（`[laughter]` 等）与大写拼音+声调数字的发音控制语法（`[B EY1 S]`）。
+- 预估 >30s 的长文本按标点分块（缩写感知），约 15s/块交叉淡化拼接。
 
 ## 4. DSHT 配音接入配置
 

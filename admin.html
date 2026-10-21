@@ -145,9 +145,81 @@
         <select id="format">
           <option value="mp3" selected>mp3</option>
           <option value="wav">wav</option>
+          <option value="flac">flac（无损）</option>
+          <option value="opus">opus（OGG 容器）</option>
+          <option value="pcm">pcm（裸 16-bit LE，无容器）</option>
         </select>
       </div>
     </div>
+
+    <details style="margin-top:14px" id="advBox">
+      <summary style="cursor:pointer;font-size:12px;color:var(--text-dim);user-select:none">
+        高级参数 · OmniVoiceGenerationConfig 全字段（默认值由服务端环境变量决定，改动即生效）
+      </summary>
+      <div class="grid" style="margin-top:10px">
+        <div style="grid-column:1/-1">
+          <label for="advLanguage">语言 language</label>
+          <input id="advLanguage" list="langList" placeholder="auto / zh / Chinese / 留空=语言无关模式">
+          <datalist id="langList"></datalist>
+          <div class="hint">
+            填 ISO 代码（<code>zh</code>/<code>en</code>/<code>ja</code>…）、英文名称（<code>Chinese</code>…）、
+            <code>auto</code>（按文本猜测）或留空（语言无关，中英混说用它）。指定语言效果略好。
+          </div>
+        </div>
+        <div>
+          <label for="advDuration">固定时长 duration（秒）</label>
+          <input id="advDuration" type="number" step="0.1" min="0.05" max="600" placeholder="留空=按文本估计">
+          <div class="hint">强制输出时长，会覆盖 speed。</div>
+        </div>
+        <div>
+          <label for="advGuidance">引导强度 guidance_scale</label>
+          <input id="advGuidance" type="number" step="0.1" min="0" max="20" value="2.0">
+        </div>
+        <div>
+          <label for="advTShift">时间步偏移 t_shift</label>
+          <input id="advTShift" type="number" step="0.01" min="0" max="1" value="0.1">
+        </div>
+        <div>
+          <label for="advLayer">层惩罚 layer_penalty_factor</label>
+          <input id="advLayer" type="number" step="0.5" min="0" max="50" value="5.0">
+        </div>
+        <div>
+          <label for="advPosTemp">位置温度 position_temperature</label>
+          <input id="advPosTemp" type="number" step="0.1" min="0.01" max="50" value="5.0">
+        </div>
+        <div>
+          <label for="advClassTemp">采样温度 class_temperature</label>
+          <input id="advClassTemp" type="number" step="0.1" min="0" max="10" value="0.0">
+          <div class="hint">0 = 贪心确定性采样。</div>
+        </div>
+        <div>
+          <label for="advPad">边距静音 pad_duration（秒）</label>
+          <input id="advPad" type="number" step="0.05" min="0" max="2" value="0.1">
+        </div>
+        <div>
+          <label for="advFade">淡入淡出 fade_duration（秒）</label>
+          <input id="advFade" type="number" step="0.05" min="0" max="2" value="0.1">
+        </div>
+        <div>
+          <label for="advChunkDur">分块时长 audio_chunk_duration（秒）</label>
+          <input id="advChunkDur" type="number" step="1" min="1" max="60" value="15">
+        </div>
+        <div>
+          <label for="advChunkThr">分块阈值 audio_chunk_threshold（秒）</label>
+          <input id="advChunkThr" type="number" step="1" min="1" max="300" value="30">
+          <div class="hint">预估音频超阈值才分块生成（约 15s/块交叉淡化）。</div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <label class="check"><input id="advDenoise" type="checkbox" checked> denoise 去噪令牌</label>
+        <label class="check"><input id="advPost" type="checkbox" checked> postprocess_output 后处理（剪句中静音&gt;0.5s / 淡入淡出 / 边距）</label>
+        <label class="check"><input id="advNormalize" type="checkbox"> normalize_text 数字转读法</label>
+      </div>
+      <div class="hint">
+        <code>normalize_text</code> 需要 WeTextProcessing 或 num2words，本机未装——勾选会直接报错，
+        数字朗读请自行在文本里写好读法（如「二零二六年」）。
+      </div>
+    </details>
 
     <div class="row">
       <label class="check"><input id="useInstr" type="checkbox"> 附加指令拼入属性串</label>
@@ -203,8 +275,11 @@
       </div>
     </div>
     <div class="row">
-      <button id="vcAdd" class="primary">创建音色</button>
+      <label class="check" title="OmniVoice 默认开：裁掉参考音频里的静音、过长的（>20s）按最大静音间隙切短、逐字稿末尾补句末标点。关掉=原样嵌入。">
+        <input id="vcPre" type="checkbox" checked> 预处理参考音频（去静音/裁过长/补句末标点）
+      </label>
       <span class="spacer"></span>
+      <button id="vcAdd" class="primary">创建音色</button>
       <span class="stats" id="vcStats"></span>
     </div>
     <div id="vcStatus"></div>
@@ -280,6 +355,8 @@ async function loadHealth() {
       h.device, h.dtype, h.cuda ? "CUDA" : "CPU"].filter(Boolean).join(" · ");
     PRESET = h.voices || [];
     CLONES = h.clones || [];
+    applyGenDefaults(h.gen_defaults);
+    loadLanguages();
     syncVoiceOptions();
     renderAttrs();
   } catch (e) {
@@ -315,6 +392,65 @@ function appendAttr(val, zh) {
   el.value = items.join(zh ? "，" : ", ");
 }
 
+/* ---------- advanced generation params ----------
+ * Mirrors the server's GEN_DEFAULTS surface. The numeric/bool inputs are
+ * pre-filled from /health's gen_defaults (single source of truth, env-
+ * overridable server-side); the static value="" attributes are only the
+ * fallback for when that field is missing. */
+const ADV_NUM = {
+  duration: "advDuration",
+  guidance_scale: "advGuidance",
+  t_shift: "advTShift",
+  layer_penalty_factor: "advLayer",
+  position_temperature: "advPosTemp",
+  class_temperature: "advClassTemp",
+  pad_duration: "advPad",
+  fade_duration: "advFade",
+  audio_chunk_duration: "advChunkDur",
+  audio_chunk_threshold: "advChunkThr",
+};
+const ADV_BOOL = {
+  denoise: "advDenoise",
+  postprocess_output: "advPost",
+  normalize_text: "advNormalize",
+};
+let ADV_DEF = {};
+
+function applyGenDefaults(def) {
+  if (!def || typeof def !== "object") return;
+  ADV_DEF = def;
+  for (const [k, id] of Object.entries(ADV_NUM)) {
+    if (def[k] != null) $(id).value = def[k];
+  }
+  for (const [k, id] of Object.entries(ADV_BOOL)) {
+    $(id).checked = !!def[k];
+  }
+  // language / duration stay empty unless a record is being replayed.
+  $("advLanguage").value = "";
+  $("advDuration").value = "";
+}
+
+function readAdvanced() {
+  const out = {};
+  const lang = $("advLanguage").value.trim();
+  if (lang) out.language = lang;
+  for (const [k, id] of Object.entries(ADV_NUM)) {
+    const v = $(id).value.trim();
+    if (v !== "") out[k] = Number(v);
+  }
+  for (const [k, id] of Object.entries(ADV_BOOL)) out[k] = $(id).checked;
+  return out;
+}
+
+async function loadLanguages() {
+  try {
+    const r = await api("/admin/languages");
+    const d = await r.json();
+    if (!d.available) return;
+    $("langList").innerHTML = d.ids.map((c) => `<option value="${esc(c)}"></option>`).join("");
+  } catch (e) { /* datalist stays empty; free text still works */ }
+}
+
 /* ---------- generate ---------- */
 $("gen").onclick = async () => {
   const btn = $("gen"), st = $("status");
@@ -335,6 +471,7 @@ $("gen").onclick = async () => {
     response_format: $("format").value,
     use_instructions: $("useInstr").checked
   };
+  Object.assign(body, readAdvanced());
 
   const t0 = performance.now();
   try {
@@ -385,6 +522,7 @@ function renderVoiceList(items) {
         <span class="badge src">clone</span>
         <span class="chip">${esc(v.name)}</span>
         ${v.duration ? `<span class="chip">${esc(v.duration)}s</span>` : ""}
+        ${v.preprocess_prompt === false ? `<span class="chip" title="参考音频原样嵌入，未做去静音/裁切">raw</span>` : ""}
         ${v.created ? `<span class="meta">${esc(fmtTime(v.created))}</span>` : ""}
       </div>
       <div class="text">ref_text：${esc(v.ref_text || "-")}</div>
@@ -475,6 +613,7 @@ $("vcAdd").onclick = async () => {
     fd.append("name", name);
     fd.append("ref_text", manual);
     fd.append("local_path", localPath);
+    fd.append("preprocess_prompt", $("vcPre").checked ? "1" : "0");
     const r = await fetch("/admin/voices", { method: "POST", body: fd });
     const d = await r.json();
     if (!r.ok) {
@@ -507,6 +646,7 @@ $("vcImport").onclick = async () => {
       path,
       prefix: $("vcName").value.trim(),
       limit: $("vcLimit").value || "20",
+      preprocess_prompt: $("vcPre").checked ? "1" : "0",
     });
     const r = await fetch("/admin/import-local", {
       method: "POST",
@@ -571,6 +711,9 @@ async function loadHistory() {
       r.elapsed_ms != null ? r.elapsed_ms + "ms" : null,
       r.bytes ? fmtBytes(r.bytes) : null
     ].filter(Boolean).map((c) => `<span class="chip">${esc(c)}</span>`).join("");
+    const gp = r.gen_params || {};
+    const gpChips = Object.keys(gp).sort().map((k) =>
+      `<span class="chip" title="高级参数（偏离默认值的项）">${esc(k)}=${esc(gp[k])}</span>`).join("");
     const audio = r.audio_url
       ? `<audio controls src="${esc(r.audio_url)}"></audio>` : "";
     return `<div class="rec" data-id="${esc(r.id)}">
@@ -582,7 +725,7 @@ async function loadHistory() {
         <span class="meta">${esc(r.id)}</span>
       </div>
       <div class="text">${esc(r.text)}</div>
-      <div class="chips">${chips}${r.instruct ? `<span class="chip">属性: ${esc(r.instruct)}</span>` : ""}</div>
+      <div class="chips">${chips}${r.instruct ? `<span class="chip">属性: ${esc(r.instruct)}</span>` : ""}${gpChips}</div>
       ${r.error ? `<div class="text" style="color:var(--err)">${esc(r.error)}</div>` : ""}
       ${audio}
       <div class="rec-actions">
@@ -614,6 +757,16 @@ $("records").addEventListener("click", async (ev) => {
     $("steps").value = rec.num_step || 32;
     $("format").value = rec.format || "mp3";
     $("useInstr").checked = !!rec.use_instructions;
+    // 高级参数：先复位到默认，再只套用这条记录偏离过默认值的项
+    applyGenDefaults(ADV_DEF);
+    const gp = rec.gen_params || {};
+    if (gp.language) $("advLanguage").value = gp.language;
+    for (const [k, id2] of Object.entries(ADV_NUM)) {
+      if (gp[k] != null) $(id2).value = gp[k];
+    }
+    for (const [k, id2] of Object.entries(ADV_BOOL)) {
+      if (gp[k] != null) $(id2).checked = !!gp[k];
+    }
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 });

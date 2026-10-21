@@ -125,6 +125,185 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SAMPLE_RATE = 24000
 MAX_TEXT = 4000
 
+# --- generation knobs (OmniVoiceGenerationConfig) ----------------------------
+# The model exposes a full generation-config surface; every field is tunable
+# per request and these are the process-wide defaults (env-overridable).
+# `language` / `duration` / `normalize_text` are opt-in only (no default) —
+# see _parse_gen_params.
+GEN_DEFAULTS: dict[str, Any] = {
+    "guidance_scale": float(os.environ.get("OMNIVOICE_GUIDANCE_SCALE", "2.0")),
+    "t_shift": float(os.environ.get("OMNIVOICE_T_SHIFT", "0.1")),
+    "layer_penalty_factor": float(os.environ.get("OMNIVOICE_LAYER_PENALTY_FACTOR", "5.0")),
+    "position_temperature": float(os.environ.get("OMNIVOICE_POSITION_TEMPERATURE", "5.0")),
+    "class_temperature": float(os.environ.get("OMNIVOICE_CLASS_TEMPERATURE", "0.0")),
+    "denoise": os.environ.get("OMNIVOICE_DENOISE", "1") == "1",
+    "postprocess_output": os.environ.get("OMNIVOICE_POSTPROCESS_OUTPUT", "1") == "1",
+    "pad_duration": float(os.environ.get("OMNIVOICE_PAD_DURATION", "0.1")),
+    "fade_duration": float(os.environ.get("OMNIVOICE_FADE_DURATION", "0.1")),
+    "audio_chunk_duration": float(os.environ.get("OMNIVOICE_AUDIO_CHUNK_DURATION", "15.0")),
+    "audio_chunk_threshold": float(os.environ.get("OMNIVOICE_AUDIO_CHUNK_THRESHOLD", "30.0")),
+}
+
+# Per-request numeric knobs: name -> (min, max). Out-of-range is a 400, never a
+# silent clamp — the caller should learn the boundary, not get surprised.
+_GEN_NUMERIC_LIMITS: dict[str, tuple[float, float]] = {
+    "speed": (0.25, 4.0),
+    "num_step": (1, 100),
+    "guidance_scale": (0.0, 20.0),
+    "t_shift": (0.0, 1.0),
+    "layer_penalty_factor": (0.0, 50.0),
+    "position_temperature": (0.01, 50.0),
+    "class_temperature": (0.0, 10.0),
+    "pad_duration": (0.0, 2.0),
+    "fade_duration": (0.0, 2.0),
+    "audio_chunk_duration": (1.0, 60.0),
+    "audio_chunk_threshold": (1.0, 300.0),
+    # Fixed output seconds; None (default) lets the model estimate from text.
+    "duration": (0.05, 600.0),
+}
+_GEN_INT_KEYS = ("num_step",)
+_GEN_BOOL_KEYS = ("denoise", "postprocess_output")
+_TN_OK: bool | None = None  # cached probe for the optional normalisation stack
+
+
+def _normalize_text_available() -> bool:
+    """Whether number→words normalisation can actually run on this host.
+
+    WeTextProcessing covers zh/en; num2words alone still covers bare integers
+    in other languages. Neither is installed here, so `normalize_text` would
+    be a silent no-op — the API refuses instead of pretending.
+    """
+    global _TN_OK
+    if _TN_OK is None:
+        try:
+            import tn.chinese.normalizer  # noqa: F401, PLC0415
+
+            _TN_OK = True
+        except Exception:  # noqa: BLE001
+            try:
+                import num2words  # noqa: F401, PLC0415
+
+                _TN_OK = True
+            except Exception:  # noqa: BLE001
+                _TN_OK = False
+    return _TN_OK
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _detect_language(text: str) -> str:
+    """Coarse single-language guess for `language=auto` (ISO 639-3 codes).
+
+    Mixed-script text is a guess by nature — the model's language-agnostic
+    mode (empty language) handles mixed text without one.
+    """
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "ja"  # kana
+    if re.search(r"[\uac00-\ud7af]", text):
+        return "ko"  # hangul
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return "zh"
+    if re.search(r"[\u0400-\u04ff]", text):
+        return "ru"
+    return "en"
+
+
+def _resolve_language_param(value: Any, text: str) -> str | None:
+    """Validate the `language` field against the model's own 646-entry table."""
+    raw = str(value or "").strip()
+    if not raw or raw.lower() == "none":
+        return None
+    if raw.lower() == "auto":
+        return _detect_language(text) if text else None
+    try:
+        from omnivoice.utils.lang_map import LANG_IDS, LANG_NAME_TO_ID  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return raw  # table unavailable: let the model judge it
+    if raw in LANG_IDS:
+        return raw
+    mapped = LANG_NAME_TO_ID.get(raw.lower())
+    if mapped:
+        return mapped
+    raise HTTPException(
+        status_code=400,
+        detail=f"无法识别的语言「{raw}」：填 ISO 代码（如 zh / en / ja）、完整名称"
+        "（如 Chinese / Japanese / Korean）、auto（按文本猜测），或留空（语言无关模式）",
+    )
+
+
+def _parse_gen_params(body: dict[str, Any], text: str = "") -> dict[str, Any]:
+    """Resolve the complete generation parameter set from a request body.
+
+    Covers every field of OmniVoiceGenerationConfig plus `language`,
+    `duration` and `normalize_text`. Missing keys fall back to GEN_DEFAULTS
+    (env-overridable); invalid values raise 400 with the exact boundary.
+    """
+    gen: dict[str, Any] = {}
+    for key, (low, high) in _GEN_NUMERIC_LIMITS.items():
+        raw = body.get(key)
+        if raw is None or raw == "":
+            if key in GEN_DEFAULTS:
+                gen[key] = GEN_DEFAULTS[key]
+            elif key == "num_step":
+                gen[key] = NUM_STEP
+            elif key == "speed":
+                gen[key] = 1.0
+            else:
+                gen[key] = None  # duration: model-estimated unless asked
+            continue
+        try:
+            value = int(raw) if key in _GEN_INT_KEYS else float(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"参数 {key} 必须是数字，收到：{raw!r}")
+        if not low <= value <= high:
+            raise HTTPException(
+                status_code=400, detail=f"参数 {key} 超出允许范围 [{low}, {high}]：{value}"
+            )
+        gen[key] = value
+    for key in _GEN_BOOL_KEYS:
+        gen[key] = _as_bool(body[key]) if key in body else GEN_DEFAULTS[key]
+    if _as_bool(body.get("normalize_text")):
+        if not _normalize_text_available():
+            raise HTTPException(
+                status_code=400,
+                detail="normalize_text 需要 WeTextProcessing（或 num2words），当前环境未安装；"
+                "数字朗读请自行在文本里写好读法（如「二零二六年」）",
+            )
+        gen["normalize_text"] = True
+    else:
+        gen["normalize_text"] = False
+    gen["language"] = _resolve_language_param(body.get("language"), text)
+    return gen
+
+
+def _gen_overrides(gen: dict[str, Any]) -> dict[str, Any]:
+    """Subset of a resolved `gen` dict that deviates from the defaults.
+
+    History records store this instead of the full resolved set: the console
+    then renders only what the caller actually changed, and "复用参数" can
+    restore exactly those fields.
+    """
+    out: dict[str, Any] = {}
+    for key, value in gen.items():
+        if key == "speed":
+            if value != 1.0:
+                out[key] = value
+        elif key == "num_step":
+            if value != NUM_STEP:
+                out[key] = value
+        elif key in GEN_DEFAULTS:
+            if value != GEN_DEFAULTS[key]:
+                out[key] = value
+        elif value not in (None, False):  # language / duration / normalize_text
+            out[key] = value
+    return out
+
 # OpenAI's published voice names, used as the fallback map when voices.json is
 # missing. Values are OmniVoice design attributes (see docs/voice-design.md).
 DEFAULT_VOICES: dict[str, str] = {
@@ -215,14 +394,37 @@ def to_wav(samples: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
+def to_flac(samples: np.ndarray) -> bytes:
+    import soundfile as sf
+
+    buffer = io.BytesIO()
+    sf.write(buffer, samples, SAMPLE_RATE, format="FLAC", subtype="PCM_16")
+    return buffer.getvalue()
+
+
+def to_opus(samples: np.ndarray) -> bytes:
+    """Opus inside an Ogg container — libsndfile has no bare-opus muxer."""
+    import soundfile as sf
+
+    buffer = io.BytesIO()
+    sf.write(buffer, samples, SAMPLE_RATE, format="OGG", subtype="OPUS")
+    return buffer.getvalue()
+
+
+def to_pcm(samples: np.ndarray) -> bytes:
+    """Raw little-endian 16-bit mono at the model rate (OpenAI `pcm` semantics)."""
+    pcm = np.clip(samples, -1.0, 1.0)
+    return (pcm * 32767.0).astype("<i2").tobytes()
+
+
 AUDIO_FORMATS = {
     "mp3": ("audio/mpeg", to_mp3),
     "wav": ("audio/wav", to_wav),
-    "pcm": ("audio/wav", to_wav),
-    "flac": ("audio/wav", to_wav),
-    "opus": ("audio/wav", to_wav),
-    "aac": ("audio/wav", to_wav),
+    "pcm": ("audio/pcm", to_pcm),
+    "flac": ("audio/flac", to_flac),
+    "opus": ("audio/ogg", to_opus),
 }
+AUDIO_FORMAT_NAMES = tuple(sorted(AUDIO_FORMATS))
 
 
 def pick_instruct(
@@ -289,12 +491,34 @@ def resolve_voice(
 
 
 def run_generate(
-    *, text: str, instruct: str | None, speed: float, num_step: int, fmt: str, clone=None
+    *,
+    text: str,
+    instruct: str | None,
+    speed: float,
+    num_step: int,
+    fmt: str,
+    clone=None,
+    gen: dict[str, Any] | None = None,
 ) -> tuple[bytes, str]:
     """Shared decode path for the OpenAI endpoint and the admin console."""
     model = get_model()
+    params = dict(gen or {})
     with _state["lock"]:
         kwargs: dict[str, Any] = {"text": text, "speed": speed, "num_step": num_step}
+        # OmniVoiceGenerationConfig surface: only send what differs from the
+        # config defaults so `generate()` picks model defaults for the rest.
+        for key, value in params.items():
+            if key in ("speed", "num_step", "language", "duration", "normalize_text"):
+                continue
+            if key in GEN_DEFAULTS and value == GEN_DEFAULTS[key]:
+                continue
+            kwargs[key] = value
+        if params.get("normalize_text"):
+            kwargs["normalize_text"] = True
+        if params.get("language"):
+            kwargs["language"] = params["language"]
+        if params.get("duration") is not None:
+            kwargs["duration"] = params["duration"]
         if clone is not None:
             kwargs["voice_clone_prompt"] = clone
         else:
@@ -393,6 +617,9 @@ def health() -> dict[str, Any]:
         "cuda": torch.cuda.is_available(),
         "voices": sorted(load_voices().keys()),
         "clones": clone_names(),
+        # So the console can show/restore the real per-field defaults instead
+        # of a hard-coded copy that drifts from the env-overridable values.
+        "gen_defaults": GEN_DEFAULTS,
     }
 
 
@@ -424,12 +651,23 @@ async def speech(request: Request, authorization: str | None = Header(default=No
     instructions = str(body.get("instructions") or "")
     fmt = str(body.get("response_format") or "mp3").lower()
     if fmt not in AUDIO_FORMATS:
-        fmt = "mp3"
+        return JSONResponse(
+            {
+                "error": {
+                    "message": f"unsupported response_format {fmt!r}; "
+                    f"supported: {', '.join(AUDIO_FORMAT_NAMES)}"
+                }
+            },
+            status_code=400,
+        )
 
     try:
-        speed = float(body.get("speed") or 1.0)
-    except (TypeError, ValueError):
-        speed = 1.0
+        gen = _parse_gen_params(body, text)
+    except HTTPException as error:
+        return JSONResponse({"error": {"message": str(error.detail)}}, status_code=400)
+    gen_overrides = _gen_overrides(gen)
+    speed = gen.pop("speed")
+    num_step = gen.pop("num_step")
 
     voices_map = load_voices()
     instruct, clone = resolve_voice(voice, instructions, voices_map)
@@ -437,7 +675,13 @@ async def speech(request: Request, authorization: str | None = Header(default=No
 
     try:
         payload, media_type = run_generate(
-            text=text, instruct=instruct, speed=speed, num_step=NUM_STEP, fmt=fmt, clone=clone
+            text=text,
+            instruct=instruct,
+            speed=speed,
+            num_step=num_step,
+            fmt=fmt,
+            clone=clone,
+            gen=gen,
         )
     except Exception as error:  # noqa: BLE001
         log.exception("generation failed")
@@ -451,8 +695,9 @@ async def speech(request: Request, authorization: str | None = Header(default=No
                         "voice_mode": "clone" if clone is not None else "design",
                         "instruct": instruct,
                         "speed": speed,
-                        "num_step": NUM_STEP,
+                        "num_step": num_step,
                         "format": fmt,
+                        "gen_params": gen_overrides,
                         "elapsed_ms": int((time.perf_counter() - started) * 1000),
                         "error": str(error),
                     },
@@ -476,8 +721,9 @@ async def speech(request: Request, authorization: str | None = Header(default=No
                     "voice_mode": "clone" if clone is not None else "design",
                     "instruct": instruct,
                     "speed": speed,
-                    "num_step": NUM_STEP,
+                    "num_step": num_step,
                     "format": fmt,
+                    "gen_params": gen_overrides,
                     "elapsed_ms": elapsed_ms,
                 },
                 payload,
@@ -577,6 +823,24 @@ def admin_voices() -> dict[str, Any]:
     return {"items": items, "total": len(items)}
 
 
+@app.get("/admin/languages", include_in_schema=False)
+def admin_languages() -> dict[str, Any]:
+    """The model's language table, for `language=` autocomplete.
+
+    `ids` are the ISO codes the model accepts; `names` the English names it
+    also understands (both directions resolve in `_resolve_language_param`).
+    """
+    try:
+        from omnivoice.utils.lang_map import LANG_IDS, LANG_NAMES  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return {"available": False, "ids": [], "names": []}
+    return {
+        "available": True,
+        "ids": sorted(LANG_IDS),
+        "names": sorted(LANG_NAMES),
+    }
+
+
 def _decode_audio(raw: bytes) -> tuple[Any, int]:
     """Decode uploaded bytes into a mono float32 waveform + sample rate."""
     import soundfile as sf  # noqa: PLC0415
@@ -602,14 +866,23 @@ def _store_clone(
     ref_text: str,
     source: str,
     raw: bytes | None = None,
+    preprocess_prompt: bool = True,
 ) -> dict[str, Any]:
-    """Encode a voice-clone prompt and persist prompt + reference audio + meta."""
+    """Encode a voice-clone prompt and persist prompt + reference audio + meta.
+
+    `preprocess_prompt` (OmniVoice default True) trims silence in the reference
+    audio and appends a sentence-final punctuation to `ref_text` when missing.
+    Turn it off only when the raw clip must be embedded verbatim — e.g. the
+    transcript is already punctuated and the silence carries meaning.
+    """
     import torch  # noqa: PLC0415
 
     model = get_model()
     try:
         prompt = model.create_voice_clone_prompt(
-            ref_audio=(torch.from_numpy(wave).unsqueeze(0), int(sr)), ref_text=ref_text
+            ref_audio=(torch.from_numpy(wave).unsqueeze(0), int(sr)),
+            ref_text=ref_text,
+            preprocess_prompt=preprocess_prompt,
         )
     except Exception as error:  # noqa: BLE001
         log.exception("voice clone prompt failed")
@@ -630,6 +903,7 @@ def _store_clone(
                 "duration": round(duration, 2),
                 "sample_rate": int(sr),
                 "source": source,
+                "preprocess_prompt": bool(preprocess_prompt),
                 "created": datetime.now().isoformat(timespec="seconds"),
             },
             ensure_ascii=False,
@@ -638,7 +912,13 @@ def _store_clone(
         encoding="utf-8",
     )
     _clone_cache.pop(name, None)
-    log.info("voice cloned: %s (%.1fs, %d chars ref_text)", name, duration, len(ref_text))
+    log.info(
+        "voice cloned: %s (%.1fs, %d chars ref_text, preprocess_prompt=%s)",
+        name,
+        duration,
+        len(ref_text),
+        preprocess_prompt,
+    )
     return {"ok": True, "name": name, "duration": round(duration, 2)}
 
 
@@ -647,6 +927,7 @@ async def admin_add_voice(
     name: str = Form(""),
     ref_text: str = Form(""),
     local_path: str = Form(""),
+    preprocess_prompt: str = Form("1"),
     audio: UploadFile | None = File(None),
 ):
     """Build a clone prompt from one reference clip and store it.
@@ -721,7 +1002,15 @@ async def admin_add_voice(
             )
 
     wave, sr = _decode_audio(raw)
-    return _store_clone(name, wave, sr, ref_text, filename, raw=raw)
+    return _store_clone(
+        name,
+        wave,
+        sr,
+        ref_text,
+        filename,
+        raw=raw,
+        preprocess_prompt=_as_bool(preprocess_prompt),
+    )
 
 
 @app.post("/admin/import-local", include_in_schema=False)
@@ -730,6 +1019,7 @@ def admin_import_local(
     prefix: str = Form(""),
     limit: int = Form(20),
     overwrite: int = Form(0),
+    preprocess_prompt: str = Form("1"),
 ) -> dict[str, Any]:
     """Register every clip in a local directory.
 
@@ -740,6 +1030,7 @@ def admin_import_local(
     `path`       file or directory on the server host
     `prefix`     prepended to each stem to build the voice name
     `limit`      max clips to import from a directory (sorted by name)
+    `preprocess_prompt`  "0" keeps reference audio verbatim (no silence trim)
     """
     resolved = _resolve_local(path)
     if not resolved.exists():
@@ -755,6 +1046,7 @@ def admin_import_local(
         )[: max(1, min(200, int(limit or 20)))]
 
     prefix_clean = _safe_name(prefix, trim=False) if (prefix or "").strip() else ""
+    keep_raw = not _as_bool(preprocess_prompt)
     created: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
 
@@ -781,7 +1073,9 @@ def admin_import_local(
             skipped.append({"file": f.name, "reason": f"读取失败：{error}"})
             continue
         try:
-            created.append(_store_clone(name, wave, sr, text, f.name, raw=raw))
+            created.append(
+                _store_clone(name, wave, sr, text, f.name, raw=raw, preprocess_prompt=not keep_raw)
+            )
         except HTTPException as error:
             skipped.append({"file": f.name, "reason": str(error.detail)})
 
@@ -1136,19 +1430,23 @@ async def admin_generate(request: Request):
     instructions = str(body.get("instructions") or "")
     fmt = str(body.get("response_format") or "mp3").lower()
     if fmt not in AUDIO_FORMATS:
-        fmt = "mp3"
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": f"unsupported response_format {fmt!r}; "
+                f"supported: {', '.join(AUDIO_FORMAT_NAMES)}",
+            },
+            status_code=400,
+        )
     use_instr = bool(body.get("use_instructions", USE_INSTRUCTIONS))
 
     try:
-        speed = float(body.get("speed") or 1.0)
-    except (TypeError, ValueError):
-        speed = 1.0
-    speed = max(0.25, min(4.0, speed))
-    try:
-        num_step = int(body.get("num_step") or NUM_STEP)
-    except (TypeError, ValueError):
-        num_step = NUM_STEP
-    num_step = max(1, min(100, num_step))
+        gen = _parse_gen_params(body, text)
+    except HTTPException as error:
+        return JSONResponse({"status": "error", "error": str(error.detail)}, status_code=400)
+    gen_overrides = _gen_overrides(gen)
+    speed = gen.pop("speed")
+    num_step = gen.pop("num_step")
 
     instruct, clone = resolve_voice(voice, instructions, load_voices(), use_instr)
     fields: dict[str, Any] = {
@@ -1162,12 +1460,19 @@ async def admin_generate(request: Request):
         "speed": speed,
         "num_step": num_step,
         "format": fmt,
+        "gen_params": gen_overrides,
     }
 
     started = time.perf_counter()
     try:
         payload, _ = run_generate(
-            text=text, instruct=instruct, speed=speed, num_step=num_step, fmt=fmt, clone=clone
+            text=text,
+            instruct=instruct,
+            speed=speed,
+            num_step=num_step,
+            fmt=fmt,
+            clone=clone,
+            gen=gen,
         )
     except Exception as error:  # noqa: BLE001
         log.exception("admin generation failed")
