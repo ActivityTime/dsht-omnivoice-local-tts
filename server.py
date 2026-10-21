@@ -73,7 +73,7 @@ HERE = Path(__file__).resolve().parent
 os.environ.setdefault("HF_HOME", str(HERE / "hf"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HERE / "hf" / "hub"))
 
-from fastapi import FastAPI, Header, HTTPException, Request  # noqa: E402
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import HTMLResponse, JSONResponse, Response  # noqa: E402
 import uvicorn  # noqa: E402
@@ -100,6 +100,17 @@ USE_INSTRUCTIONS = os.environ.get("OMNI_TTS_USE_INSTRUCTIONS", "0") == "1"
 # holding meta.json plus the decoded audio, so runs can be replayed later.
 HISTORY_DIR = Path(os.environ.get("OMNI_TTS_HISTORY_DIR", HERE / "history"))
 ADMIN_FILE = Path(os.environ.get("OMNI_TTS_ADMIN_PAGE", HERE / "admin.html"))
+
+# --- cloned voices (voice clone prompts) ------------------------------------
+# create_voice_clone_prompt() is expensive, so its result is written to disk
+# with VoiceClonePrompt.save() and memoised in memory. Each voice is three
+# files: <name>.pt (official prompt), <name>.json (our metadata), and
+# <name>.ref<ext> (the original upload, kept for playback).
+CLONE_DIR = Path(os.environ.get("OMNI_TTS_CLONE_DIR", HERE / "voices"))
+_CLONE_SUFFIX = ".pt"
+# Rejects path separators and Windows-reserved characters.
+_NAME_RE = re.compile(r"^[^\\/:*?\"<>|\r\n\t]{1,64}$")
+_clone_cache: dict[str, Any] = {}
 # Requests arriving on the OpenAI endpoint are only logged when enabled: DSH
 # Tavern can fire one per message bubble and would fill the disk.
 LOG_API = os.environ.get("OMNI_TTS_LOG_API", "0") == "1"
@@ -226,15 +237,63 @@ def pick_instruct(
     return instruct.strip(" ,，")
 
 
+def _clone_path(name: str) -> Path:
+    """`<name>.pt` inside the clone directory; the name is validated first."""
+    if not _NAME_RE.match(name or ""):
+        raise HTTPException(status_code=400, detail="invalid voice name")
+    return CLONE_DIR / f"{name}{_CLONE_SUFFIX}"
+
+
+def clone_names() -> list[str]:
+    """Names of every voice prompt stored on disk."""
+    if not CLONE_DIR.exists():
+        return []
+    return sorted(p.name[: -len(_CLONE_SUFFIX)] for p in CLONE_DIR.glob(f"*{_CLONE_SUFFIX}"))
+
+
+def get_clone(name: str):
+    """VoiceClonePrompt for `name`: memory first, otherwise load from disk."""
+    if name in _clone_cache:
+        return _clone_cache[name]
+    path = _clone_path(name)
+    if not path.exists():
+        return None
+    from omnivoice import VoiceClonePrompt
+
+    prompt = VoiceClonePrompt.load(str(path))
+    _clone_cache[name] = prompt
+    return prompt
+
+
+def resolve_voice(
+    voice: str,
+    instructions: str,
+    voices: dict[str, str],
+    use_instructions: bool | None = None,
+) -> tuple[str | None, Any]:
+    """Return `(instruct, clone)` for a voice field.
+
+    A stored clone wins over the attribute map, and the two modes are mutually
+    exclusive: cloning carries its own timbre, so no instruct is sent.
+    """
+    key = (voice or "").strip()
+    if key in clone_names():
+        return None, get_clone(key)
+    return pick_instruct(key, instructions, voices, use_instructions), None
+
+
 def run_generate(
-    *, text: str, instruct: str, speed: float, num_step: int, fmt: str
+    *, text: str, instruct: str | None, speed: float, num_step: int, fmt: str, clone=None
 ) -> tuple[bytes, str]:
     """Shared decode path for the OpenAI endpoint and the admin console."""
     model = get_model()
     with _state["lock"]:
-        chunks = model.generate(
-            text=text, instruct=instruct or None, speed=speed, num_step=num_step
-        )
+        kwargs: dict[str, Any] = {"text": text, "speed": speed, "num_step": num_step}
+        if clone is not None:
+            kwargs["voice_clone_prompt"] = clone
+        else:
+            kwargs["instruct"] = instruct or None
+        chunks = model.generate(**kwargs)
     if not chunks:
         raise RuntimeError("model returned no audio")
     samples = chunks[0] if isinstance(chunks, (list, tuple)) else chunks
@@ -327,6 +386,7 @@ def health() -> dict[str, Any]:
         "dtype": DTYPE_NAME,
         "cuda": torch.cuda.is_available(),
         "voices": sorted(load_voices().keys()),
+        "clones": clone_names(),
     }
 
 
@@ -365,12 +425,13 @@ async def speech(request: Request, authorization: str | None = Header(default=No
     except (TypeError, ValueError):
         speed = 1.0
 
-    instruct = pick_instruct(voice, instructions, load_voices())
+    voices_map = load_voices()
+    instruct, clone = resolve_voice(voice, instructions, voices_map)
     started = time.perf_counter()
 
     try:
         payload, media_type = run_generate(
-            text=text, instruct=instruct, speed=speed, num_step=NUM_STEP, fmt=fmt
+            text=text, instruct=instruct, speed=speed, num_step=NUM_STEP, fmt=fmt, clone=clone
         )
     except Exception as error:  # noqa: BLE001
         log.exception("generation failed")
@@ -381,6 +442,7 @@ async def speech(request: Request, authorization: str | None = Header(default=No
                         "source": "api",
                         "text": text,
                         "voice": voice,
+                        "voice_mode": "clone" if clone is not None else "design",
                         "instruct": instruct,
                         "speed": speed,
                         "num_step": NUM_STEP,
@@ -405,6 +467,7 @@ async def speech(request: Request, authorization: str | None = Header(default=No
                     "source": "api",
                     "text": text,
                     "voice": voice,
+                    "voice_mode": "clone" if clone is not None else "design",
                     "instruct": instruct,
                     "speed": speed,
                     "num_step": NUM_STEP,
@@ -483,6 +546,134 @@ def admin_audio(rid: str, download: int = 0):
     return Response(content=(directory / name).read_bytes(), media_type=media_type, headers=headers)
 
 
+_REF_SUFFIXES = (".ref.wav", ".ref.mp3", ".ref.flac", ".ref.ogg", ".ref.m4a", ".ref.aac")
+_REF_MEDIA = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+}
+
+
+@app.get("/admin/voices", include_in_schema=False)
+def admin_voices() -> dict[str, Any]:
+    """Stored clones: metadata only, no prompt is decoded or loaded."""
+    items: list[dict[str, Any]] = []
+    for name in clone_names():
+        entry: dict[str, Any] = {"name": name, "cached": name in _clone_cache}
+        meta = CLONE_DIR / f"{name}.json"
+        if meta.exists():
+            try:
+                entry.update(json.loads(meta.read_text(encoding="utf-8")))
+            except Exception:  # noqa: BLE001
+                pass
+        items.append(entry)
+    return {"items": items, "total": len(items)}
+
+
+@app.post("/admin/voices", include_in_schema=False)
+async def admin_add_voice(
+    name: str = Form(...),
+    ref_text: str = Form(""),
+    audio: UploadFile = File(...),
+):
+    """Build a clone prompt from one reference clip and store it.
+
+    `ref_text` is mandatory on purpose: leaving it empty makes the model load
+    its Whisper ASR (~3 GB) to transcribe, and this host has no commit memory
+    to spare.
+    """
+    import soundfile as sf  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    name = (name or "").strip()
+    if not _NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="invalid voice name")
+    ref_text = (ref_text or "").strip()
+    if not ref_text:
+        raise HTTPException(
+            status_code=400,
+            detail="ref_text 必填：参考音频的逐字稿（留空会触发 ASR 自动转写，多占约 3GB 内存）",
+        )
+
+    raw = await audio.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="audio is empty")
+    try:
+        data, sr = sf.read(io.BytesIO(raw), always_2d=False, dtype="float32")
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"无法解码音频：{error}")
+
+    wave = np.asarray(data, dtype=np.float32)
+    if wave.ndim == 2:  # soundfile returns (frames, channels)
+        wave = wave.mean(axis=1)
+    if wave.size == 0:
+        raise HTTPException(status_code=400, detail="audio is empty after decode")
+    duration = float(wave.size) / float(sr)
+
+    model = get_model()
+    try:
+        prompt = model.create_voice_clone_prompt(
+            ref_audio=(torch.from_numpy(wave).unsqueeze(0), int(sr)), ref_text=ref_text
+        )
+    except Exception as error:  # noqa: BLE001
+        log.exception("voice clone prompt failed")
+        raise HTTPException(status_code=500, detail=f"克隆失败：{error}")
+
+    CLONE_DIR.mkdir(parents=True, exist_ok=True)
+    prompt.save(str(CLONE_DIR / f"{name}{_CLONE_SUFFIX}"))
+    suffix = Path(audio.filename or "").suffix.lower()
+    ref_suffix = f".ref{suffix}" if f".ref{suffix}" in _REF_SUFFIXES else ".ref.wav"
+    (CLONE_DIR / f"{name}{ref_suffix}").write_bytes(raw)
+    (CLONE_DIR / f"{name}.json").write_text(
+        json.dumps(
+            {
+                "name": name,
+                "ref_text": ref_text,
+                "duration": round(duration, 2),
+                "sample_rate": int(sr),
+                "source": audio.filename or "",
+                "created": datetime.now().isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    _clone_cache.pop(name, None)
+    log.info("voice cloned: %s (%.1fs, %d chars ref_text)", name, duration, len(ref_text))
+    return {"ok": True, "name": name, "duration": round(duration, 2)}
+
+
+@app.delete("/admin/voices/{name}", include_in_schema=False)
+def admin_delete_voice(name: str) -> dict[str, Any]:
+    path = _clone_path(name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="voice not found")
+    path.unlink(missing_ok=True)
+    (CLONE_DIR / f"{name}.json").unlink(missing_ok=True)
+    for suffix in _REF_SUFFIXES:
+        (CLONE_DIR / f"{name}{suffix}").unlink(missing_ok=True)
+    _clone_cache.pop(name, None)
+    return {"ok": True}
+
+
+@app.get("/admin/voices/{name}/audio", include_in_schema=False)
+def admin_voice_audio(name: str):
+    """Play back the reference clip a clone was built from."""
+    if not _NAME_RE.match(name or ""):
+        raise HTTPException(status_code=400, detail="invalid voice name")
+    for suffix in _REF_SUFFIXES:
+        candidate = CLONE_DIR / f"{name}{suffix}"
+        if candidate.exists():
+            ext = suffix.replace(".ref", "")
+            return Response(
+                content=candidate.read_bytes(),
+                media_type=_REF_MEDIA.get(ext, "application/octet-stream"),
+            )
+    raise HTTPException(status_code=404, detail="reference audio not found")
+
+
 @app.post("/admin/generate", include_in_schema=False)
 async def admin_generate(request: Request):
     """Console-initiated synthesis: arbitrary params, always archived."""
@@ -517,11 +708,12 @@ async def admin_generate(request: Request):
         num_step = NUM_STEP
     num_step = max(1, min(100, num_step))
 
-    instruct = pick_instruct(voice, instructions, load_voices(), use_instr)
+    instruct, clone = resolve_voice(voice, instructions, load_voices(), use_instr)
     fields: dict[str, Any] = {
         "source": "admin",
         "text": text,
         "voice": voice,
+        "voice_mode": "clone" if clone is not None else "design",
         "instructions": instructions,
         "instruct": instruct,
         "use_instructions": use_instr,
@@ -533,7 +725,7 @@ async def admin_generate(request: Request):
     started = time.perf_counter()
     try:
         payload, _ = run_generate(
-            text=text, instruct=instruct, speed=speed, num_step=num_step, fmt=fmt
+            text=text, instruct=instruct, speed=speed, num_step=num_step, fmt=fmt, clone=clone
         )
     except Exception as error:  # noqa: BLE001
         log.exception("admin generation failed")
@@ -560,6 +752,7 @@ def main() -> None:
     log.info("listening on http://%s:%d", host, port)
     log.info("admin console: http://%s:%d/admin", host, port)
     log.info("history archive: %s", HISTORY_DIR)
+    log.info("cloned voices: %s (%d stored)", CLONE_DIR, len(clone_names()))
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 

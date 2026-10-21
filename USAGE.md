@@ -35,6 +35,7 @@ OmniVoice（k2-fsa / 小米 Next-gen Kaldi 开源 TTS，~0.6B 参数，扩散语
 | `models/OmniVoice/` | 模型权重（见 §2.1） | ✅ 必需 | **3.1 GB** |
 | `python/` | 内置 embeddable CPython 3.13 运行时 + 全部依赖 | ✅ 必需 | ~7 GB |
 | `history/` | 管理台请求归档（见 §3.5），运行时生成 | 产物 | 随使用增长 |
+| `voices/` | 声音克隆音色库（见 §3.6），运行时生成 | 产物 | 每音色约 7 KB + 原始音频 |
 | `download_model.py` | 从 hf-mirror 拉取模型权重的脚本 | 可选 | <1 KB |
 | `server.log` | 运行日志（启动后生成） | 产物 | 随运行增长 |
 | `test_out.mp3` / `test_out2.mp3` | 验证用生成产物 | 产物 | ~50/28 KB |
@@ -83,6 +84,7 @@ python\python.exe server.py > server.log 2>&1
 | `OMNI_TTS_VOICES` | `voices.json` | 音色映射文件 |
 | `OMNI_TTS_USE_INSTRUCTIONS` | `0` | 管理台「附加属性」开关的默认值 |
 | `OMNI_TTS_HISTORY_DIR` | `history/` | 管理台请求归档目录 |
+| `OMNI_TTS_CLONE_DIR` | `voices/` | 声音克隆音色库目录 |
 | `OMNI_TTS_LOG_API` | `0` | 是否也归档 OpenAI 端点（`/v1/audio/speech`）的请求；DSHT 逐条调用会持续写盘，默认关 |
 | `OMNI_TTS_ADMIN_PAGE` | `admin.html` | 管理台页面文件位置 |
 
@@ -127,6 +129,38 @@ curl http://127.0.0.1:8890/health
 | GET | `/admin/audio/{id}?download=1` | 回放 / 下载产出音频 |
 
 ---
+
+### 3.6 声音克隆（Voice Clone）
+
+属性造声（Voice Design）受**固定属性白名单**限制（EN 23 / ZH 25 项，无情绪轴、不可中英混用），
+做不出「某个具体角色 + 某种情绪」。声音克隆用一段参考音频绕开这个限制：音色与情绪都来自那段音频，
+模型据此朗读任意新文本。
+
+| 项 | 要求 |
+|---|---|
+| 参考音频 | 3–10 秒（>20 秒官方会警告：更慢、更占内存、克隆质量下降），wav/mp3/flac/ogg |
+| `ref_text` | **必填**：参考音频的逐字稿。留空会触发 Whisper ASR 自动转写（多占约 3 GB） |
+| 音色名称 | 不含 `\ / : * ? " < > \|`；创建后 `voice` 字段填这个名字即可 |
+
+**存储与缓存**（`voices/<name>.*`）：
+
+| 文件 | 内容 |
+|---|---|
+| `<name>.pt` | `VoiceClonePrompt.save()` 产物，约 7 KB（音频已 token 化，极小） |
+| `<name>.json` | 元信息：`ref_text`、时长、采样率、来源文件名、创建时间 |
+| `<name>.ref<ext>` | 原始参考音频，供页面回听 |
+
+进程内另有 `dict` 缓存已加载的 prompt，命中即不再读盘；**服务重启不丢失**（落在磁盘上）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/admin/voices` | 音色库列表（只读元信息，不加载 prompt） |
+| POST | `/admin/voices` | multipart 上传：`name`、`ref_text`、`audio` |
+| DELETE | `/admin/voices/{name}` | 删除音色及其参考音频 |
+| GET | `/admin/voices/{name}/audio` | 回听原始参考音频 |
+
+> 两种模式**互斥**：`voice` 命中克隆音色时，属性串不再参与生成（音色已由参考音频决定）。
+> DSHT 侧无感——voice 字段填克隆音色名即可，走的还是同一个 OpenAI 端点。
 
 ## 4. DSHT 配音接入配置
 
