@@ -77,6 +77,10 @@
   .check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
   .check input { width: auto; }
   .hint { font-size: 11.5px; color: var(--text-dim); margin-top: 5px; }
+  .hint b, .hint .dv { color: var(--text); font-weight: 650; }
+  .adv-group { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--line); }
+  .adv-group:first-of-type { margin-top: 10px; padding-top: 0; border-top: none; }
+  .adv-title { font-size: 12px; font-weight: 650; color: var(--accent); letter-spacing: .5px; margin-bottom: 8px; }
   #status { font-size: 13px; min-height: 20px; margin-top: 10px; }
   #status.busy { color: var(--accent); }
   #status.err { color: var(--err); }
@@ -134,11 +138,12 @@
       <div>
         <label for="speed">语速 speed</label>
         <input id="speed" type="number" step="0.05" min="0.5" max="2" value="1.0">
+        <div class="hint">默认 <b>1.0</b> · 建议 <b>0.8–1.2</b><br>语速倍率，&gt;1 快 &lt;1 慢；与 duration 同时设时 duration 优先。</div>
       </div>
       <div>
         <label for="steps">扩散步数 num_step</label>
         <input id="steps" type="number" step="1" min="1" max="100" value="32">
-        <div class="hint">越大越稳越慢。</div>
+        <div class="hint">默认 <b class="dv" data-for="__num_step__">32</b> · 建议 <b>16–48</b><br>越大越稳越慢，48 以上收益递减。</div>
       </div>
       <div>
         <label for="format">输出格式</label>
@@ -149,75 +154,122 @@
           <option value="opus">opus（OGG 容器）</option>
           <option value="pcm">pcm（裸 16-bit LE，无容器）</option>
         </select>
+        <div class="hint">mp3 体积最小 · wav 无损通用 · flac 无损压缩 · opus 省流量 · pcm 给程序直读。</div>
       </div>
     </div>
 
     <details style="margin-top:14px" id="advBox">
       <summary style="cursor:pointer;font-size:12px;color:var(--text-dim);user-select:none">
-        高级参数 · OmniVoiceGenerationConfig 全字段（默认值由服务端环境变量决定，改动即生效）
+        高级参数 · OmniVoiceGenerationConfig 全字段（每项标注 默认值 / 建议值 / 说明，默认值取自服务端实时配置）
       </summary>
-      <div class="grid" style="margin-top:10px">
-        <div style="grid-column:1/-1">
-          <label for="advLanguage">语言 language</label>
-          <input id="advLanguage" list="langList" placeholder="auto / zh / Chinese / 留空=语言无关模式">
-          <datalist id="langList"></datalist>
-          <div class="hint">
-            填 ISO 代码（<code>zh</code>/<code>en</code>/<code>ja</code>…）、英文名称（<code>Chinese</code>…）、
-            <code>auto</code>（按文本猜测）或留空（语言无关，中英混说用它）。指定语言效果略好。
+
+      <div class="adv-group">
+        <div class="adv-title">语言与文本</div>
+        <div class="grid">
+          <div style="grid-column:1/-1">
+            <label for="advLanguage">语言 language</label>
+            <input id="advLanguage" list="langList" placeholder="auto / zh / Chinese / 留空=语言无关模式">
+            <datalist id="langList"></datalist>
+            <div class="hint">
+              默认 <b class="dv" data-for="language">空（语言无关模式）</b> · 建议 <b>按主要语言填</b><br>
+              填 ISO 代码（<code>zh</code>/<code>en</code>/<code>ja</code>…）或英文名称（<code>Chinese</code>…，646 项可补全）；
+              <code>auto</code> 按文本猜测；留空走语言无关模式——中英混说只能用它。指定语言效果略好。
+            </div>
+          </div>
+          <div>
+            <label for="advDuration">固定时长 duration（秒）</label>
+            <input id="advDuration" type="number" step="0.1" min="0.05" max="600" placeholder="留空=按文本估计">
+            <div class="hint">默认 <b>空（按文本估计）</b> · 建议 <b>留空</b><br>强制输出时长，设置后覆盖 speed；仅卡时间轴时用。</div>
+          </div>
+          <div>
+            <label class="check" style="margin-bottom:5px">
+              <input id="advNormalize" type="checkbox"> normalize_text 数字转读法
+            </label>
+            <div class="hint">默认 <b>关</b> · 建议 <b>按需</b><br>
+              数字/日期/货币转口头读法。本机未装 WeTextProcessing / num2words，勾选直接 400——读法请写进文本（如「二零二六年」）。</div>
           </div>
         </div>
-        <div>
-          <label for="advDuration">固定时长 duration（秒）</label>
-          <input id="advDuration" type="number" step="0.1" min="0.05" max="600" placeholder="留空=按文本估计">
-          <div class="hint">强制输出时长，会覆盖 speed。</div>
-        </div>
-        <div>
-          <label for="advGuidance">引导强度 guidance_scale</label>
-          <input id="advGuidance" type="number" step="0.1" min="0" max="20" value="2.0">
-        </div>
-        <div>
-          <label for="advTShift">时间步偏移 t_shift</label>
-          <input id="advTShift" type="number" step="0.01" min="0" max="1" value="0.1">
-        </div>
-        <div>
-          <label for="advLayer">层惩罚 layer_penalty_factor</label>
-          <input id="advLayer" type="number" step="0.5" min="0" max="50" value="5.0">
-        </div>
-        <div>
-          <label for="advPosTemp">位置温度 position_temperature</label>
-          <input id="advPosTemp" type="number" step="0.1" min="0.01" max="50" value="5.0">
-        </div>
-        <div>
-          <label for="advClassTemp">采样温度 class_temperature</label>
-          <input id="advClassTemp" type="number" step="0.1" min="0" max="10" value="0.0">
-          <div class="hint">0 = 贪心确定性采样。</div>
-        </div>
-        <div>
-          <label for="advPad">边距静音 pad_duration（秒）</label>
-          <input id="advPad" type="number" step="0.05" min="0" max="2" value="0.1">
-        </div>
-        <div>
-          <label for="advFade">淡入淡出 fade_duration（秒）</label>
-          <input id="advFade" type="number" step="0.05" min="0" max="2" value="0.1">
-        </div>
-        <div>
-          <label for="advChunkDur">分块时长 audio_chunk_duration（秒）</label>
-          <input id="advChunkDur" type="number" step="1" min="1" max="60" value="15">
-        </div>
-        <div>
-          <label for="advChunkThr">分块阈值 audio_chunk_threshold（秒）</label>
-          <input id="advChunkThr" type="number" step="1" min="1" max="300" value="30">
-          <div class="hint">预估音频超阈值才分块生成（约 15s/块交叉淡化）。</div>
+      </div>
+
+      <div class="adv-group">
+        <div class="adv-title">采样与引导（影响音质与稳定性，非必要不动）</div>
+        <div class="grid">
+          <div>
+            <label for="advGuidance">引导强度 guidance_scale</label>
+            <input id="advGuidance" type="number" step="0.1" min="0" max="20" value="2.0">
+            <div class="hint">默认 <b class="dv" data-for="guidance_scale">2.0</b> · 建议 <b>1.5–3.0</b><br>
+              分类器自由引导：越大越严格贴合 instruct/文本，过高声音发紧不自然。文字造声想严格贴属性串可到 3–5。</div>
+          </div>
+          <div>
+            <label for="advTShift">时间步偏移 t_shift</label>
+            <input id="advTShift" type="number" step="0.01" min="0" max="1" value="0.1">
+            <div class="hint">默认 <b class="dv" data-for="t_shift">0.1</b> · 建议 <b>0.05–0.2</b><br>
+              越小越强调低 SNR 段（先定结构后抠细节）。偏离默认有风险，音质异常先调回 0.1。</div>
+          </div>
+          <div>
+            <label for="advLayer">层惩罚 layer_penalty_factor</label>
+            <input id="advLayer" type="number" step="0.5" min="0" max="50" value="5.0">
+            <div class="hint">默认 <b class="dv" data-for="layer_penalty_factor">5.0</b> · 建议 <b>保持默认</b><br>
+              促使靠前的 codebook 层（语义层）先解码。调小可能出现声学瑕疵。</div>
+          </div>
+          <div>
+            <label for="advPosTemp">位置温度 position_temperature</label>
+            <input id="advPosTemp" type="number" step="0.1" min="0.01" max="50" value="5.0">
+            <div class="hint">默认 <b class="dv" data-for="position_temperature">5.0</b> · 建议 <b>保持默认</b><br>位置选择温度，官方调好的值，没有调的动机。</div>
+          </div>
+          <div>
+            <label for="advClassTemp">采样温度 class_temperature</label>
+            <input id="advClassTemp" type="number" step="0.1" min="0" max="10" value="0.0">
+            <div class="hint">默认 <b class="dv" data-for="class_temperature">0.0</b> · 建议 <b>0</b><br>
+              0 = 贪心确定性采样（可复现）。想要多样性可试 0.3–0.8，但可能读错字。</div>
+          </div>
         </div>
       </div>
-      <div class="row" style="margin-top:10px">
-        <label class="check"><input id="advDenoise" type="checkbox" checked> denoise 去噪令牌</label>
-        <label class="check"><input id="advPost" type="checkbox" checked> postprocess_output 后处理（剪句中静音&gt;0.5s / 淡入淡出 / 边距）</label>
-        <label class="check"><input id="advNormalize" type="checkbox"> normalize_text 数字转读法</label>
+
+      <div class="adv-group">
+        <div class="adv-title">后处理（输出整形）</div>
+        <div class="grid">
+          <div>
+            <label class="check" style="margin-bottom:5px"><input id="advDenoise" type="checkbox" checked> denoise 去噪令牌</label>
+            <div class="hint">默认 <b>开</b> · 建议 <b>保持开启</b><br>是否加 <code>&lt;|denoise|&gt;</code> 令牌；关掉输出更"毛糙"。</div>
+          </div>
+          <div>
+            <label class="check" style="margin-bottom:5px"><input id="advPost" type="checkbox" checked> postprocess_output 后处理</label>
+            <div class="hint">默认 <b>开</b> · 建议 <b>保持开启</b><br>
+              剪掉句中 &gt;0.5s 的静音、淡入淡出、加边距静音。静音本身有意义（停顿表演）才关。</div>
+          </div>
+          <div>
+            <label for="advPad">边距静音 pad_duration（秒）</label>
+            <input id="advPad" type="number" step="0.05" min="0" max="2" value="0.1">
+            <div class="hint">默认 <b class="dv" data-for="pad_duration">0.1</b> · 建议 <b>0.05–0.2</b><br>输出两端各加的静音；0 = 不加，句首辅音可能被切。</div>
+          </div>
+          <div>
+            <label for="advFade">淡入淡出 fade_duration（秒）</label>
+            <input id="advFade" type="number" step="0.05" min="0" max="2" value="0.1">
+            <div class="hint">默认 <b class="dv" data-for="fade_duration">0.1</b> · 建议 <b>0.05–0.2</b><br>头尾淡入淡出时长，防爆音。</div>
+          </div>
+        </div>
       </div>
-      <div class="hint">
-        <code>normalize_text</code> 需要 WeTextProcessing 或 num2words，本机未装——勾选会直接报错，
-        数字朗读请自行在文本里写好读法（如「二零二六年」）。
+
+      <div class="adv-group">
+        <div class="adv-title">长文本分块（预估超阈值才启用，块间交叉淡化）</div>
+        <div class="grid">
+          <div>
+            <label for="advChunkDur">分块时长 audio_chunk_duration（秒）</label>
+            <input id="advChunkDur" type="number" step="1" min="1" max="60" value="15">
+            <div class="hint">默认 <b class="dv" data-for="audio_chunk_duration">15</b> · 建议 <b>10–20</b><br>长文本按标点分块，每块约此时长。</div>
+          </div>
+          <div>
+            <label for="advChunkThr">分块阈值 audio_chunk_threshold（秒）</label>
+            <input id="advChunkThr" type="number" step="1" min="1" max="300" value="30">
+            <div class="hint">默认 <b class="dv" data-for="audio_chunk_threshold">30</b> · 建议 <b>20–60</b><br>预估音频超此秒数才分块生成，短文本不走分块。</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <button id="advReset" type="button">重置为默认</button>
+        <span class="hint" style="margin:0">默认值来自服务端 <code>/health</code>（env 可覆盖），不是页面写死的；改乱了点左边。</span>
       </div>
     </details>
 
@@ -355,7 +407,7 @@ async function loadHealth() {
       h.device, h.dtype, h.cuda ? "CUDA" : "CPU"].filter(Boolean).join(" · ");
     PRESET = h.voices || [];
     CLONES = h.clones || [];
-    applyGenDefaults(h.gen_defaults);
+    applyGenDefaults(Object.assign({ __num_step: h.num_step_default }, h.gen_defaults));
     loadLanguages();
     syncVoiceOptions();
     renderAttrs();
@@ -428,6 +480,14 @@ function applyGenDefaults(def) {
   // language / duration stay empty unless a record is being replayed.
   $("advLanguage").value = "";
   $("advDuration").value = "";
+  // 主表单里同样有默认值的两个字段：speed 恒 1.0，num_step 走 env
+  $("speed").value = 1.0;
+  if (def.__num_step != null) $("steps").value = def.__num_step;
+  // 每个字段旁的「默认值」标注同步为服务端实时值，避免页面写死、env 改了 UI 还说谎
+  document.querySelectorAll(".dv[data-for]").forEach((el) => {
+    const v = def[el.dataset.for];
+    if (v != null) el.textContent = v;
+  });
 }
 
 function readAdvanced() {
@@ -450,6 +510,14 @@ async function loadLanguages() {
     $("langList").innerHTML = d.ids.map((c) => `<option value="${esc(c)}"></option>`).join("");
   } catch (e) { /* datalist stays empty; free text still works */ }
 }
+
+/* 重置：高级参数 + 主表单的语速/步数全部回到服务端默认值 */
+$("advReset").onclick = () => {
+  applyGenDefaults(ADV_DEF);
+  const st = $("status");
+  st.className = "ok";
+  st.textContent = "已重置为服务端默认值（含语速与扩散步数）。";
+};
 
 /* ---------- generate ---------- */
 $("gen").onclick = async () => {

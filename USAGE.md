@@ -114,11 +114,12 @@ curl http://127.0.0.1:8890/health
 
 1. **自定义参数发起请求** —— 文本、声音/属性描述、附加属性、语速 `speed`（0.25–4）、扩散步数
    `num_step`（1–100）、输出格式 `mp3`/`wav`/`flac`/`opus`/`pcm`、是否把附加属性拼入属性串。
-2. **高级参数折叠区** —— `OmniVoiceGenerationConfig` 全字段（见 §3.8 参数表）：语言 `language`
-   （带 646 项自动补全）、固定时长 `duration`、`guidance_scale`、`t_shift`、`layer_penalty_factor`、
-   `position_temperature`、`class_temperature`、`pad_duration`、`fade_duration`、`audio_chunk_duration`、
-   `audio_chunk_threshold`、`denoise`、`postprocess_output`、`normalize_text`。输入框默认值由
-   `/health` 的 `gen_defaults` 下发（即上表环境变量的实时值），不留静态副本。
+2. **高级参数折叠区** —— `OmniVoiceGenerationConfig` 全字段，按**语言与文本 / 采样与引导 / 后处理 /
+   长文本分块**四组呈现，每项标注「默认值 · 建议值 · 说明」：语言 `language`（带 646 项自动补全）、
+   固定时长 `duration`、`guidance_scale`、`t_shift`、`layer_penalty_factor`、`position_temperature`、
+   `class_temperature`、`pad_duration`、`fade_duration`、`audio_chunk_duration`、`audio_chunk_threshold`、
+   `denoise`、`postprocess_output`、`normalize_text`。默认值由 `/health` 的 `gen_defaults` 实时下发
+   （环境变量改了页面跟着变），附「重置为默认」按钮一键还原全部字段（含语速与步数）。
 2. **属性速选** —— 内置 OmniVoice 合法属性项（英文 23 项 / 中文 25 项），点选即按正确分隔符拼装
    （英文 `, `、中文 `，`）；切换语言时自动重置，避免中英混用被模型拒绝。
 3. **请求与产出归档** —— 每次请求（**含失败**）写入 `history/<id>/`：
@@ -228,28 +229,32 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 除 OpenAI 标准字段外，OmniVoice 的 `OmniVoiceGenerationConfig` 全字段 + `language` / `duration` /
 `normalize_text` 均可按请求覆盖。缺省值即 §3.3 环境变量（`/health` 的 `gen_defaults` 可查实时值）。
 
-| 字段 | 类型 | 默认 | 范围 / 取值 | 说明 |
-|---|---|---|---|---|
-| `input`（或 `text`） | str | — | 必填，≤4000 字 | 要合成的文本 |
-| `voice` | str | `alloy` | 预设名 / 属性串 / 克隆音色名 | 见 §3.7 与 §4 |
-| `instructions` | str | 空 | OmniVoice 合法属性项 | 需 `use_instructions` 或模型名含 gpt-4o 才拼入 |
-| `response_format` | str | `mp3` | `mp3` `wav` `pcm` `flac` `opus` | 未知值返回 **400**（列出合法值），不静默回落 |
-| `speed` | num | `1.0` | 0.25–4 | 语速倍率 |
-| `num_step` | int | `32` | 1–100 | 扩散步数 |
-| `language` | str | 空 | ISO 代码 / 英文名称 / `auto` / 空 | 空=语言无关模式（中英混说用它）；`auto` 按文本猜（kana→ja、hangul→ko、汉字→zh、西里尔→ru、其余→en）；无法识别返回 400 |
-| `duration` | num | 空 | 0.05–600 | 固定输出秒数，**覆盖 speed**；空=按文本估计 |
-| `normalize_text` | bool | `false` | — | 数字/日期/货币转读法。**本机未装 WeTextProcessing/num2words，勾选返回 400**，不会静默跳过 |
-| `guidance_scale` | num | `2.0` | 0–20 | 分类器自由引导强度 |
-| `t_shift` | num | `0.1` | 0–1 | 时间步偏移 |
-| `layer_penalty_factor` | num | `5.0` | 0–50 | 层惩罚因子 |
-| `position_temperature` | num | `5.0` | 0.01–50 | 位置选择温度 |
-| `class_temperature` | num | `0.0` | 0–10 | token 采样温度（0=贪心） |
-| `denoise` | bool | `true` | — | 是否加 `<|denoise|>` 令牌 |
-| `postprocess_output` | bool | `true` | — | 剪 >0.5s 句中静音 / 淡入淡出 / 边距静音 |
-| `pad_duration` | num | `0.1` | 0–2 | 边距静音秒数 |
-| `fade_duration` | num | `0.1` | 0–2 | 淡入淡出秒数 |
-| `audio_chunk_duration` | num | `15` | 1–60 | 长文本分块时长（秒） |
-| `audio_chunk_threshold` | num | `30` | 1–300 | 预估超此秒数才分块 |
+| 字段 | 类型 | 默认 | 范围 / 取值 | 建议 | 说明 |
+|---|---|---|---|---|---|
+| `input`（或 `text`） | str | — | 必填，≤4000 字 | — | 要合成的文本 |
+| `voice` | str | `alloy` | 预设名 / 属性串 / 克隆音色名 | 按需 | 见 §3.7 与 §4 |
+| `instructions` | str | 空 | OmniVoice 合法属性项 | 留空 | 需 `use_instructions` 或模型名含 gpt-4o 才拼入 |
+| `response_format` | str | `mp3` | `mp3` `wav` `pcm` `flac` `opus` | `mp3` | 未知值返回 **400**（列出合法值），不静默回落 |
+| `speed` | num | `1.0` | 0.25–4 | 0.8–1.2 | 语速倍率 |
+| `num_step` | int | `32` | 1–100 | 16–48 | 扩散步数，越大越稳越慢，48+ 收益递减 |
+| `language` | str | 空 | ISO 代码 / 英文名称 / `auto` / 空 | 按主要语言填 | 空=语言无关模式（中英混说用它）；`auto` 按文本猜（kana→ja、hangul→ko、汉字→zh、西里尔→ru、其余→en）；无法识别返回 400 |
+| `duration` | num | 空 | 0.05–600 | 留空 | 固定输出秒数，**覆盖 speed**；空=按文本估计 |
+| `normalize_text` | bool | `false` | — | 按需 | 数字/日期/货币转读法。**本机未装 WeTextProcessing/num2words，勾选返回 400**，不会静默跳过 |
+| `guidance_scale` | num | `2.0` | 0–20 | 1.5–3.0 | 分类器自由引导强度，越大越严格贴合 instruct/文本，过高发紧不自然 |
+| `t_shift` | num | `0.1` | 0–1 | 0.05–0.2 | 时间步偏移，越小越强调低 SNR 段（先定结构后细节） |
+| `layer_penalty_factor` | num | `5.0` | 0–50 | 保持默认 | 层惩罚因子，促使靠前 codebook 层（语义）先解码；调小声学瑕疵 |
+| `position_temperature` | num | `5.0` | 0.01–50 | 保持默认 | 位置选择温度 |
+| `class_temperature` | num | `0.0` | 0–10 | 0 | token 采样温度（0=贪心确定性）；想多样可试 0.3–0.8，可能读错字 |
+| `denoise` | bool | `true` | — | 保持开启 | 是否加 `<|denoise|>` 令牌 |
+| `postprocess_output` | bool | `true` | — | 保持开启 | 剪 >0.5s 句中静音 / 淡入淡出 / 边距静音 |
+| `pad_duration` | num | `0.1` | 0–2 | 0.05–0.2 | 输出两端静音秒数；0=不加，句首辅音可能被切 |
+| `fade_duration` | num | `0.1` | 0–2 | 0.05–0.2 | 头尾淡入淡出秒数，防爆音 |
+| `audio_chunk_duration` | num | `15` | 1–60 | 10–20 | 长文本分块时长（秒），块间交叉淡化 |
+| `audio_chunk_threshold` | num | `30` | 1–300 | 20–60 | 预估音频超此秒数才分块 |
+
+> 管理台高级参数区按 **语言与文本 / 采样与引导 / 后处理 / 长文本分块** 四组呈现，每个字段旁标注
+> 「默认 · 建议 · 说明」，默认值由 `/health` 的 `gen_defaults` 实时下发（env 改了页面跟着变），
+> 并有「重置为默认」按钮一键还原（含主表单的语速与步数）。
 
 **输出格式说明**
 

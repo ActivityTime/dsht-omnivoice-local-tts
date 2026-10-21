@@ -620,6 +620,7 @@ def health() -> dict[str, Any]:
         # So the console can show/restore the real per-field defaults instead
         # of a hard-coded copy that drifts from the env-overridable values.
         "gen_defaults": GEN_DEFAULTS,
+        "num_step_default": NUM_STEP,
     }
 
 
