@@ -308,8 +308,7 @@
     </details>
 
     <div class="row">
-      <label class="check"><input id="useInstr" type="checkbox"> 附加指令拼入属性串</label>
-      <span class="hint" style="margin:0">文字造声与<b>克隆音色都适用</b>：克隆时属性叠加在克隆音色之上。</span>
+      <span class="hint" style="margin:0">附加属性恒拼入属性串，<b>文字造声与克隆音色都适用</b>：克隆时属性叠加在克隆音色之上。</span>
       <span class="spacer"></span>
       <button id="gen" class="primary">生成</button>
     </div>
@@ -711,8 +710,7 @@ $("gen").onclick = async () => {
     instructions: $("instructions").value.trim(),
     speed: Number($("speed").value || 1),
     num_step: Number($("steps").value || 32),
-    response_format: $("format").value,
-    use_instructions: $("useInstr").checked
+    response_format: $("format").value
   };
   Object.assign(body, readAdvanced());
 
@@ -1144,7 +1142,6 @@ $("records").addEventListener("click", async (ev) => {
     $("speed").value = rec.speed || 1;
     $("steps").value = rec.num_step || 32;
     $("format").value = rec.format || "mp3";
-    $("useInstr").checked = !!rec.use_instructions;
     // 高级参数：先复位到默认，再只套用这条记录偏离过默认值的项
     applyGenDefaults(ADV_DEF);
     const gp = rec.gen_params || {};

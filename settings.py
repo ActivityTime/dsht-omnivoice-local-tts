@@ -263,12 +263,6 @@ SETTINGS: dict[str, dict[str, Any]] = {
         "min": 0, "max": 1000,
         "desc": "日志轮转：保留备份数。",
     },
-    # --- instruct ----------------------------------------------------------
-    "OMNI_TTS_USE_INSTRUCTIONS": {
-        "default": "1", "kind": "bool", "group": "instruct", "live": False,
-        "desc": "是否把 instructions 字段解析为属性项。默认开——解析器只保留白名单属性项，"
-                "情绪短语会被逐项丢弃。0 = 完全忽略该字段。",
-    },
 }
 
 # Variables the service sets for itself (thread limits, the HF cache). They are

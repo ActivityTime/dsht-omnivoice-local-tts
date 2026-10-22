@@ -175,15 +175,12 @@ ASR_MODEL_ID = os.environ.get(
 ASR_DEVICE = os.environ.get("OMNIVOICE_ASR_DEVICE", "").strip() or None
 API_KEY = os.environ.get("OMNI_TTS_KEY", "")  # empty = accept any key
 VOICES_FILE = Path(os.environ.get("OMNI_TTS_VOICES", HERE / "voices.json"))
-# Whether the `instructions` field is parsed as voice-design attributes.
-#
-# This used to default to off, because DSHT-Tavern sends `instructions` as an
-# emotion phrase ("温柔地") and OmniVoice's design attributes have no emotion
-# axis. The parser now keeps only whitelisted attribute items and drops
-# everything else, so an emotion phrase no longer needs to be ignored wholesale
-# -- it is dropped item by item instead. The switch is kept as a way to turn
-# the field off entirely, and now defaults to on.
-USE_INSTRUCTIONS = os.environ.get("OMNI_TTS_USE_INSTRUCTIONS", "1") == "1"
+# The `instructions` field is always parsed, the same way as the voice field.
+# It used to sit behind a switch, left over from a time when an emotion phrase
+# here had to be ignored wholesale; the parser now keeps only whitelisted
+# attribute items and routes emotion phrases through the mapping layer, so
+# there is nothing left for a switch to protect and nothing to turn off --
+# turning it off silently dropped every emotion DSH-Tavern sent.
 
 # --- request history (admin console) ----------------------------------------
 # Each request made through the admin console is persisted as a directory
@@ -1246,7 +1243,6 @@ def resolve_voice(
     voice: str,
     instructions: str,
     voices: dict[str, str],
-    use_instructions: bool | None = None,
 ) -> tuple[str | None, Any, VoiceParts]:
     """Resolve the voice field and the extra instructions.
 
@@ -1273,10 +1269,9 @@ def resolve_voice(
 
     parts = parse_voice_field(voice or "", voices, clones, inline_tags, table, blocked)
 
-    # `use_instructions` is tri-state: True forces the field on, False forces
-    # it off, None follows the global OMNI_TTS_USE_INSTRUCTIONS switch.
-    use_extra = USE_INSTRUCTIONS if use_instructions is None else bool(use_instructions)
-    extra = (instructions or "") if use_extra else ""
+    # Always parsed: an emotion phrase here is the only channel DSH-Tavern
+    # has for expressing one, and the mapping layer turns it into a tag.
+    extra = instructions or ""
     if extra:
         extra_parts = parse_voice_field(extra, voices, clones, inline_tags, table)
         # A clone named in the extra instructions cannot replace the one
@@ -1768,17 +1763,11 @@ async def speech(request: Request, authorization: str | None = Header(default=No
     num_step = gen.pop("num_step")
 
     voices_map = load_voices()
-    # `use_instructions` is tri-state here: absent -> follow the global
-    # OMNI_TTS_USE_INSTRUCTIONS switch (on by default), 0 -> explicitly
-    # off, 1 -> explicitly on.
-    use_instr = body.get("use_instructions")
-    if use_instr is None:
-        use_instr_arg: bool | None = None
-    else:
-        use_instr_arg = bool(use_instr)
-    instruct, clone, voice_parts = resolve_voice(
-        voice, instructions, voices_map, use_instr_arg
-    )
+    # `use_instructions` is gone: the field is always parsed. A request that
+    # still carries it is accepted and the flag ignored, so older callers --
+    # and anything that copied the old docs -- keep working rather than
+    # silently losing their emotion.
+    instruct, clone, voice_parts = resolve_voice(voice, instructions, voices_map)
     # Inline tags travel in the text, so they are prepended to it. The
     # cache key uses the resulting text, so a tagged request never hits
     # an untagged entry.
@@ -3267,8 +3256,6 @@ async def admin_generate(request: Request):
             },
             status_code=400,
         )
-    use_instr = bool(body.get("use_instructions", USE_INSTRUCTIONS))
-
     try:
         gen = _parse_gen_params(body, text)
     except HTTPException as error:
@@ -3277,9 +3264,7 @@ async def admin_generate(request: Request):
     speed = gen.pop("speed")
     num_step = gen.pop("num_step")
 
-    instruct, clone, voice_parts = resolve_voice(
-        voice, instructions, load_voices(), use_instr
-    )
+    instruct, clone, voice_parts = resolve_voice(voice, instructions, load_voices())
     if voice_parts.inline_prefix:
         text = f"{voice_parts.inline_prefix} {text}"
     fields: dict[str, Any] = {
@@ -3289,7 +3274,6 @@ async def admin_generate(request: Request):
         "voice_mode": _voice_mode(clone, instruct),
         "instructions": instructions,
         "instruct": instruct,
-        "use_instructions": use_instr,
         "speed": speed,
         "num_step": num_step,
         "format": fmt,

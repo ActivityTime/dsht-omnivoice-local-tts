@@ -109,7 +109,6 @@ python\python.exe server.py > server.log 2>&1
 | `OMNI_TTS_HOST` | `127.0.0.1` | 监听地址（改 `0.0.0.0` 可局域网共享） |
 | `OMNI_TTS_KEY` | 空 | 鉴权密钥；空 = 不校验（DSHT 留空即可） |
 | `OMNI_TTS_VOICES` | `voices.json` | 音色映射文件 |
-| `OMNI_TTS_USE_INSTRUCTIONS` | `1` | 是否解析 `instructions` 字段为属性项。**默认开**——解析器只保留白名单属性项，情绪短语先经 §3.11 映射层转换，映射不到的逐项丢弃（不再需要整段忽略）。设 `0` 可完全关闭该字段 |
 | `OMNI_TTS_EMOTION_MAP_OFFICIAL` | `1` | 情绪映射是否允许指向**官方非语言标签**（laughter/sigh/surprise-ah/question-ah…）和**声音属性**。默认 `1`：允许，取向由所选映射模板决定（见 §3.11）。设 `0` 则屏蔽这两类目标，整张表只剩微调的语气/情绪标签。**即时生效** |
 | `OMNI_TTS_HISTORY_DIR` | `history/` | 管理台请求归档目录 |
 | `OMNI_TTS_CLONE_DIR` | `voices/` | 声音克隆音色库目录 |
@@ -149,7 +148,7 @@ curl http://127.0.0.1:8890/health
 **能做什么**
 
 1. **自定义参数发起请求** —— 文本、声音/属性描述、附加属性、语速 `speed`（0.25–4）、扩散步数
-   `num_step`（1–100）、输出格式 `mp3`/`wav`/`flac`/`opus`/`pcm`、是否把附加属性拼入属性串。
+   `num_step`（1–100）、输出格式 `mp3`/`wav`/`flac`/`opus`/`pcm`。
 2. **高级参数折叠区** —— `OmniVoiceGenerationConfig` 全字段，按**语言与文本 / 采样与引导 / 后处理 /
    长文本分块**四组呈现，每项标注「默认值 · 建议值 · 说明」：语言 `language`（带 646 项自动补全）、
    固定时长 `duration`、`guidance_scale`、`t_shift`、`layer_penalty_factor`、`position_temperature`、
@@ -314,18 +313,17 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 > **克隆音色与文字属性可以同时使用**。
 >
 > - **怎么传**：`voice` 填克隆音色名，属性写在 `instructions` 字段
->   （管理台：「声音」填克隆名 + 「附加属性」填属性串，并**勾选**「附加指令拼入属性串」）。
+>   （管理台：「声音」填克隆名 + 「附加属性」填属性串即可，恒生效）。
 > - **效果**：属性会**叠加在克隆音色之上**，实测把克隆的音高从 308 Hz 压到 118 Hz
 >   （`male, low pitch`），或抬到 338 Hz（`female, high pitch`）。
 > - **情绪短语先走映射层**：DSHT 的情绪短语（如「温柔地」）虽然不在 voice-design 白名单里，
 >   但会**先经 §3.11 的映射层**转成模型认得的标签（基座上是耳语属性、情绪微调上是 `[whisper]`
 >   行内标签）；**映射不到的**才丢弃而非报错，请求照常成功。
-> - **显式关闭**：请求里带 `use_instructions: 0` 可禁用（端点支持该参数）；
->   管理台取消勾选即禁用。
 >
-> ⚠️ `instructions` 字段是否被解析，受 `OMNI_TTS_USE_INSTRUCTIONS` 约束
-> （**默认开**）；请求里带 `use_instructions: 0` 可单独关闭，
-> 带 `1` 可单独开启。管理台则由「附加指令拼入属性串」勾选框控制。
+> ℹ️ `instructions` **恒被解析**，没有开关。早期版本有 `OMNI_TTS_USE_INSTRUCTIONS` 环境变量与
+> 请求参数 `use_instructions`，已移除——关掉它会**静默丢掉 DSHT 的全部情绪**
+> （DSHT 只在 `instructions` 里送情绪，且从不带该参数）。现在仍带 `use_instructions` 的请求
+> 会被接受但该字段忽略，不影响旧调用方。
 >
 > ⚠️ 属性是**相对参考音色的偏移**，不是绝对设定：参考音色已满足某属性时位移趋近于零
 > （给女声克隆加 `female, high pitch` 几乎不动）。**想改克隆的性别/音高，
@@ -344,7 +342,7 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 |---|---|---|---|---|---|
 | `input`（或 `text`） | str | — | 必填，≤4000 字 | — | 要合成的文本 |
 | `voice` | str | `alloy` | **可混用**：预设名 / 属性串 / 克隆音色名 / 行内标签 | 按需 | 见 §3.7 与 §4；无法识别的项被丢弃并在请求日志标记 |
-| `instructions` | str | 空 | 与 `voice` 同逻辑（属性项 / 预设名 / 克隆名 / 行内标签） | 留空 | 需 `use_instructions` 或模型名含 gpt-4o 才拼入 |
+| `instructions` | str | 空 | 与 `voice` 同逻辑（属性项 / 预设名 / 克隆名 / 行内标签） | 留空 | **恒拼入**（无开关；旧参数 `use_instructions` 已废弃，传了也忽略） |
 | `response_format` | str | `mp3` | `mp3` `wav` `pcm` `flac` `opus` | `mp3` | 未知值返回 **400**（列出合法值），不静默回落 |
 | `speed` | num | `1.0` | 0.25–4 | 0.8–1.2 | 语速倍率 |
 | `num_step` | int | `32` | 1–100 | 16–48 | 扩散步数，越大越稳越慢，48+ 收益递减 |
