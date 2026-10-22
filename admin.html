@@ -138,6 +138,7 @@
     <a href="#voices">音色库</a>
     <a href="#history">历史记录</a>
     <a href="#models">模型管理</a>
+    <a href="#config">配置</a>
     <a href="#apirec" class="accent">API 记录 / 请求日志</a>
   </nav>
 </header>
@@ -424,6 +425,25 @@
     <div class="row">
       <span class="meta" id="mScanInfo"></span>
     </div>
+  </section>
+
+  <section class="card" id="config">
+    <h2>配置 <span class="meta">（环境变量与参数默认值）</span></h2>
+
+    <div class="toolbar">
+      <button id="cfgReload">重新载入</button>
+      <button id="cfgSave" class="primary">保存修改</button>
+      <button id="cfgReset" class="danger">恢复全部默认</button>
+      <span class="spacer"></span>
+      <span class="stats" id="cfgStats"></span>
+    </div>
+    <div class="hint" style="margin:0 0 10px">
+      改完点「保存修改」：<b>即时生效</b>的项立刻应用（生成参数默认值等），
+      <b>需重启</b>的项在下次启动服务时生效。配置存放在 <code id="cfgPath">runtime_config.json</code>，
+      真实环境变量优先级更高（会被标为「环境变量覆盖」）。
+    </div>
+    <div id="cfgGroups"></div>
+    <div id="cfgStatus"></div>
   </section>
 
   <section class="card" id="apirec">
@@ -1269,6 +1289,156 @@ loadVoices();
 loadHistory();
 loadApiLog();
 loadApiRecords();
+
+/* ---------- settings / configuration ---------- */
+let CFG_SETTINGS = [];
+let CFG_GROUPS = [];
+const CFG_EDITED = new Map();
+
+function cfgSourceLabel(s) {
+  if (s.source === "env") return { text: "环境变量覆盖", cls: "tag warn" };
+  if (s.source === "file") return { text: "已配置", cls: "tag on" };
+  return { text: "默认", cls: "tag" };
+}
+
+function cfgInput(s) {
+  const id = "cfg_" + s.name;
+  const edited = CFG_EDITED.get(s.name);
+  const value = edited !== undefined ? edited : (s.value ?? "");
+  if (s.kind === "bool") {
+    const on = value === "1" || value === "true";
+    return `<label class="check" style="min-width:90px"><input type="checkbox" id="${id}" data-cfg="${esc(s.name)}" ${on ? "checked" : ""}> ${on ? "开" : "关"}</label>`;
+  }
+  if (s.kind === "int" || s.kind === "float") {
+    const attrs = [];
+    if (s.min !== null && s.min !== undefined) attrs.push(`min="${s.min}"`);
+    if (s.max !== null && s.max !== undefined) attrs.push(`max="${s.max}"`);
+    attrs.push(`step="${s.kind === "int" ? "1" : "any"}"`);
+    return `<input type="number" ${attrs.join(" ")} id="${id}" data-cfg="${esc(s.name)}" value="${esc(value)}" style="width:130px">`;
+  }
+  if (s.choices && s.choices.length) {
+    return `<select id="${id}" data-cfg="${esc(s.name)}">${s.choices.map((c) =>
+      `<option value="${esc(c)}" ${c === value ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>`;
+  }
+  return `<input type="text" id="${id}" data-cfg="${esc(s.name)}" value="${esc(value)}" style="flex:1;min-width:220px">`;
+}
+
+function renderSettings(data) {
+  CFG_SETTINGS = data.settings || [];
+  if (data.groups && data.groups.length) CFG_GROUPS = data.groups;
+  $("cfgPath").textContent = data.config_file || $("cfgPath").textContent;
+  const stored = data.stored_count !== undefined ? data.stored_count : CFG_EDITED.size;
+  $("cfgStats").textContent =
+    `${CFG_SETTINGS.length} 个变量 · 已配置 ${stored} · `
+    + `即时生效 ${CFG_SETTINGS.filter((s) => s.live).length}`;
+
+  $("cfgGroups").innerHTML = CFG_GROUPS.map((g) => {
+    const items = CFG_SETTINGS.filter((s) => s.group === g.key);
+    if (!items.length) return "";
+    const rows = items.map((s) => {
+      const src = cfgSourceLabel(s);
+      const live = s.live
+        ? '<span class="tag on">即时生效</span>'
+        : '<span class="tag warn">需重启</span>';
+      const changed = CFG_EDITED.has(s.name) ? '<span class="tag on">已改</span>' : "";
+      return `<div class="rec" style="margin-bottom:8px">
+        <div class="row">
+          <code style="min-width:250px">${esc(s.name)}</code>
+          ${live} ${changed}
+          <span class="${src.cls}">${esc(src.text)}</span>
+          <span class="spacer"></span>
+          ${cfgInput(s)}
+        </div>
+        <div class="meta">${esc(s.desc || "")}</div>
+        <div class="meta">默认值 <code>${esc(s.kind === "bool" ? (s.default === "1" ? "开" : "关") : s.default)}</code>${
+          s.min !== null && s.min !== undefined ? ` · 范围 ${s.min}–${s.max}` : ""
+        }</div>
+      </div>`;
+    }).join("");
+    return `<h3 class="sub">${esc(g.name)}</h3>${rows}`;
+  }).join("");
+}
+
+async function loadSettings() {
+  try {
+    const r = await api("/admin/settings");
+    const data = await r.json();
+    if (!r.ok) {
+      $("cfgGroups").innerHTML = `<div class="empty">${esc(data.detail || "读取失败")}</div>`;
+      return;
+    }
+    renderSettings(data);
+  } catch (e) {
+    $("cfgGroups").innerHTML = `<div class="empty">读取失败：${esc(String(e))}</div>`;
+  }
+}
+
+$("cfgGroups").addEventListener("change", (ev) => {
+  const el = ev.target.closest("[data-cfg]");
+  if (!el) return;
+  const name = el.dataset.cfg;
+  const spec = CFG_SETTINGS.find((s) => s.name === name);
+  if (!spec) return;
+  const value = spec.kind === "bool" ? (el.checked ? "1" : "0") : el.value;
+  if (spec.kind === "bool" && el.parentElement) {
+    const label = el.parentElement;
+    label.textContent = "";
+    label.appendChild(el);
+    label.appendChild(document.createTextNode(` ${el.checked ? "开" : "关"}`));
+  }
+  if (String(value) === String(spec.value)) CFG_EDITED.delete(name);
+  else CFG_EDITED.set(name, value);
+  renderSettings({
+    groups: CFG_GROUPS, settings: CFG_SETTINGS,
+    stored_count: CFG_EDITED.size, config_file: $("cfgPath").textContent,
+  });
+});
+
+$("cfgReload").onclick = () => { CFG_EDITED.clear(); loadSettings(); };
+
+$("cfgSave").onclick = async () => {
+  if (!CFG_EDITED.size) {
+    $("cfgStatus").innerHTML = '<div class="hint">没有待保存的修改。</div>';
+    return;
+  }
+  const values = {};
+  CFG_EDITED.forEach((v, k) => { values[k] = v; });
+  $("cfgSave").disabled = true;
+  try {
+    const r = await api("/admin/settings", { method: "POST", body: JSON.stringify({ values }) });
+    const d = await r.json();
+    if (!r.ok) {
+      $("cfgStatus").innerHTML = `<div class="text" style="color:var(--err)">保存失败：${esc(d.detail || d.error || r.status)}</div>`;
+    } else {
+      const bits = [];
+      if (d.live_applied && d.live_applied.length) bits.push(`即时生效：${d.live_applied.join(", ")}`);
+      if (d.needs_restart && d.needs_restart.length) bits.push(`需重启：${d.needs_restart.join(", ")}`);
+      if (d.shadowed_by_env && d.shadowed_by_env.length) bits.push(`被环境变量覆盖（改动暂不生效）：${d.shadowed_by_env.join(", ")}`);
+      $("cfgStatus").innerHTML = `<div class="hint">已保存 ${Object.keys(d.changed || {}).length} 项。${esc(bits.join("　"))}</div>`;
+      CFG_EDITED.clear();
+      await loadSettings();
+    }
+  } catch (e) {
+    $("cfgStatus").innerHTML = `<div class="text" style="color:var(--err)">保存失败：${esc(String(e))}</div>`;
+  } finally {
+    $("cfgSave").disabled = false;
+  }
+};
+
+$("cfgReset").onclick = async () => {
+  if (!confirm("恢复全部默认？将清空 runtime_config.json（真实环境变量不受影响）。")) return;
+  const r = await api("/admin/settings/reset", { method: "POST", body: JSON.stringify({}) });
+  const d = await r.json();
+  if (!r.ok) {
+    $("cfgStatus").innerHTML = `<div class="text" style="color:var(--err)">恢复失败：${esc(d.detail || r.status)}</div>`;
+    return;
+  }
+  CFG_EDITED.clear();
+  $("cfgStatus").innerHTML = '<div class="hint">已恢复默认。需重启的项在下次启动时生效。</div>';
+  await loadSettings();
+};
+
+loadSettings();
 loadModels();
 </script>
 </body>

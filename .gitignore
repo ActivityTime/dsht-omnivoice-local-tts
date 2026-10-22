@@ -41,6 +41,10 @@ ehthumbs.db
 /model_config.json
 /model_config.json.tmp
 
+# ===== 运行时配置（控制台「配置」页写入的变量覆盖，本机状态）=====
+/runtime_config.json
+/runtime_config.json.tmp
+
 # ===== 外部权重挂载点（Windows 目录联接，不是真实内容，不入库）=====
 /finetunes/
 

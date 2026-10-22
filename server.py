@@ -77,6 +77,33 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 
+# The bundled interpreter puts its own zip on sys.path[0] rather than the
+# script's directory, so a sibling module is not importable by default.
+# Put the project root on the path explicitly.
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+# Configured values are injected into the environment before anything reads
+# it, so the code below keeps using plain os.environ.get(...) unchanged. A
+# variable already present in the real environment wins: an operator can
+# always override a stored value for a single run.
+try:
+    import settings as _settings  # noqa: E402
+
+    _INJECTED = _settings.apply_configured_env()
+    if _INJECTED:
+        # logging is not configured yet this early, so this line goes to
+        # stderr only; the same list is repeated in the startup log below.
+        print(
+            f"[omnivoice] applied {len(_INJECTED)} configured env values: "
+            + ", ".join(sorted(_INJECTED)),
+            flush=True,
+        )
+except Exception as _error:  # noqa: BLE001
+    _settings = None
+    _INJECTED = {}
+    print(f"[omnivoice] settings registry unavailable: {_error}", flush=True)
+
 # Hugging Face cache lives next to this file unless the caller overrides it.
 os.environ.setdefault("HF_HOME", str(HERE / "hf"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HERE / "hf" / "hub"))
@@ -2116,6 +2143,188 @@ def admin_models_scan() -> dict[str, Any]:
     return {"ok": True, "dirs": [str(d) for d in dirs], "found": found}
 
 
+# --- settings ----------------------------------------------------------------
+# Every configurable environment variable, its default, and where the current
+# value comes from. The registry lives in settings.py; the values the user
+# sets are stored in runtime_config.json and injected into the environment at
+# startup, so a change to a start-up-time variable needs a restart while a
+# "live" one takes effect at once.
+
+# The generation defaults whose environment variable maps onto a field of
+# GEN_DEFAULTS. Changing one of these can be applied to the running process.
+_LIVE_GEN_KEYS = {
+    "OMNIVOICE_GUIDANCE_SCALE": "guidance_scale",
+    "OMNIVOICE_T_SHIFT": "t_shift",
+    "OMNIVOICE_LAYER_PENALTY_FACTOR": "layer_penalty_factor",
+    "OMNIVOICE_POSITION_TEMPERATURE": "position_temperature",
+    "OMNIVOICE_CLASS_TEMPERATURE": "class_temperature",
+    "OMNIVOICE_DENOISE": "denoise",
+    "OMNIVOICE_POSTPROCESS_OUTPUT": "postprocess_output",
+    "OMNIVOICE_PAD_DURATION": "pad_duration",
+    "OMNIVOICE_FADE_DURATION": "fade_duration",
+    "OMNIVOICE_AUDIO_CHUNK_DURATION": "audio_chunk_duration",
+    "OMNIVOICE_AUDIO_CHUNK_THRESHOLD": "audio_chunk_threshold",
+}
+
+
+def _apply_live_settings(
+    values: dict[str, str], to_environment: bool = True
+) -> list[str]:
+    """Push the values that can change without a restart into the process.
+
+    `to_environment` writes the value back into the environment so the
+    console shows what is in effect; the reset path leaves the environment
+    alone, because there the built-in default is what applies.
+
+    Returns the names that were applied live.
+    """
+    applied: list[str] = []
+    for name, raw in values.items():
+        if name in _LIVE_GEN_KEYS:
+            key = _LIVE_GEN_KEYS[name]
+            spec = _settings.SETTINGS[name]
+            try:
+                if spec.get("kind") == "bool":
+                    GEN_DEFAULTS[key] = raw == "1"
+                elif spec.get("kind") == "int":
+                    GEN_DEFAULTS[key] = int(raw)
+                else:
+                    GEN_DEFAULTS[key] = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if to_environment:
+                # Keep the environment in step with the live value, so the
+                # console shows what is actually in effect.
+                os.environ[name] = raw
+                _settings.mark_applied(name)
+            applied.append(name)
+        elif name == "OMNI_TTS_MODEL_DIRS":
+            # Read on every scan, so setting it takes effect right away.
+            os.environ[name] = raw
+            if to_environment:
+                _settings.mark_applied(name)
+            applied.append(name)
+    return applied
+
+
+@app.get("/admin/settings", include_in_schema=False)
+def admin_settings() -> dict[str, Any]:
+    """Every configurable variable, with its default, current value and source."""
+    if _settings is None:
+        raise HTTPException(status_code=503, detail="settings registry unavailable")
+    stored = _settings.load_stored()
+    return {
+        "ok": True,
+        "groups": [{"key": key, "name": name} for key, name in _settings.GROUPS],
+        "settings": _settings.describe(),
+        "config_file": str(_settings.config_path()),
+        "config_exists": _settings.config_path().exists(),
+        "stored_count": len(stored),
+        "restart_required": [
+            item["name"] for item in _settings.describe() if not item["live"]
+        ],
+    }
+
+
+@app.post("/admin/settings", include_in_schema=False)
+async def admin_settings_save(request: Request) -> dict[str, Any]:
+    """Store configuration values. Live ones apply at once, the rest on restart."""
+    if _settings is None:
+        raise HTTPException(status_code=503, detail="settings registry unavailable")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_values = body.get("values")
+    if not isinstance(raw_values, dict):
+        raise HTTPException(status_code=400, detail="缺少 values 对象")
+
+    stored = _settings.load_stored()
+    changed: dict[str, str] = {}
+    errors: list[str] = []
+    for name, raw in raw_values.items():
+        if name not in _settings.SETTINGS:
+            errors.append(f"未知变量：{name}")
+            continue
+        try:
+            normalised = _settings.validate(name, str(raw))
+        except ValueError as error:
+            errors.append(str(error))
+            continue
+        stored[name] = normalised
+        changed[name] = normalised
+
+    if errors:
+        raise HTTPException(status_code=400, detail="；".join(errors))
+
+    _settings.save_stored(stored)
+    # A value the real environment already holds is not overridden, so warn
+    # rather than pretend the change took effect. Variables this process
+    # injected from the file are ours, not an operator's override.
+    applied = _settings.applied_names()
+    shadowed = [
+        name for name in changed
+        if name in os.environ and name not in applied
+        and os.environ[name] != changed[name]
+    ]
+    live = _apply_live_settings(changed)
+    return {
+        "ok": True,
+        "changed": changed,
+        "live_applied": live,
+        "needs_restart": [name for name in changed if name not in live],
+        "shadowed_by_env": shadowed,
+        "settings": _settings.describe(),
+    }
+
+
+@app.post("/admin/settings/reset", include_in_schema=False)
+async def admin_settings_reset(request: Request) -> dict[str, Any]:
+    """Clear the stored configuration (the environment keeps its own values)."""
+    if _settings is None:
+        raise HTTPException(status_code=503, detail="settings registry unavailable")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    names = body.get("names") if isinstance(body, dict) else None
+    stored = _settings.load_stored()
+    cleared: list[str] = []
+    if isinstance(names, list) and names:
+        for name in names:
+            if stored.pop(str(name), None) is not None:
+                cleared.append(str(name))
+    else:
+        cleared = list(stored)
+        stored = {}
+    _settings.save_stored(stored)
+    # Only the values this process applied from the file are ours to remove;
+    # a variable the operator set in the environment stays untouched.
+    for name in _settings.applied_names():
+        if name not in stored and name in os.environ:
+            os.environ.pop(name, None)
+    # Put the live values back to their defaults so the running process
+    # matches the cleared configuration. The default is applied to the
+    # in-process state only -- the environment is left clean, so the value
+    # reads as "default" rather than as an environment override.
+    defaults = {
+        name: _settings.SETTINGS[name]["default"] for name in cleared
+        if name in _settings.SETTINGS
+    }
+    restored = _apply_live_settings(defaults, to_environment=False)
+    # The stored value is gone, so these are no longer "configured".
+    for name in restored:
+        _settings.unmark_applied(name)
+    return {
+        "ok": True,
+        "cleared": cleared,
+        "restored_live": restored,
+        "settings": _settings.describe(),
+    }
+
+
 def _detect_model_type(folder: Path) -> str | None:
     """Classify a directory as 'lora' or 'checkpoint' (or None if not a model)."""
     if (folder / "adapter_config.json").exists():
@@ -3123,6 +3332,11 @@ def main() -> None:
         sys.exit(1)
     log.info("listening on http://%s:%d", host, port)
     log.info("admin console: http://%s:%d/admin", host, port)
+    if _INJECTED:
+        log.info(
+            "applied configured env: %s",
+            ", ".join(f"{k}={v}" for k, v in sorted(_INJECTED.items())),
+        )
     log.info("log file: %s (<=%d MB x %d backups)", LOG_FILE, LOG_MAX_BYTES // 1048576, LOG_BACKUPS)
     log.info("history archive: %s", HISTORY_DIR)
     if API_RECORD:
