@@ -106,6 +106,8 @@
   audio { width: 100%; height: 36px; margin: 4px 0 8px; }
   .rec-actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .empty { color: var(--text-dim); font-size: 13px; padding: 20px 0; text-align: center; }
+  .is-hidden { display: none !important; }
+  .search-clear { flex: none; }
   code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-soft); padding: 1px 4px; border-radius: 4px; }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
@@ -374,6 +376,11 @@
       <button id="vcAdd" class="primary">创建音色</button>
       <span class="stats" id="vcStats"></span>
     </div>
+    <div class="row">
+      <input type="text" data-search-for="vcList" placeholder="搜索音色：名称 / 备注 / 逐字稿…" style="flex:1;min-width:220px">
+      <button type="button" class="search-clear">清除</button>
+      <span class="stats" id="vcListSearchStat"></span>
+    </div>
     <div id="vcStatus"></div>
     <div id="vcList" style="margin-top:14px"><div class="empty">加载中…</div></div>
   </section>
@@ -391,6 +398,11 @@
     <div class="row">
       <button id="vgNew" class="primary" type="button">新建分组</button>
       <span class="stats" id="vgStats"></span>
+    </div>
+    <div class="row">
+      <input type="text" data-search-for="vgList" placeholder="搜索分组：分组名 / 备注 / 成员音色 / 子标签…" style="flex:1;min-width:220px">
+      <button type="button" class="search-clear">清除</button>
+      <span class="stats" id="vgListSearchStat"></span>
     </div>
     <div id="vgList" style="margin-top:14px"><div class="empty">加载中…</div></div>
   </section>
@@ -813,6 +825,7 @@ async function loadVoices() {
   CLONES = items.map((v) => v.name);
   $("vcStats").textContent = `已存 ${data.total} 个音色`;
   renderVoiceList(items);
+  applyListSearch("vcList");
   syncVoiceOptions();
   loadVoiceGroups();
 }
@@ -1880,6 +1893,7 @@ async function loadVoiceGroups() {
   }
   VG_VOICES = data.voices || [];
   renderVoiceGroups(data.groups || []);
+  applyListSearch("vgList");
   $("vgStats").textContent = `共 ${(data.groups || []).length} 个分组`;
 }
 
@@ -1934,6 +1948,65 @@ $("vgList").addEventListener("click", (ev) => {
   if (ev.target.classList.contains("vg-mdel")) { ev.target.closest(".vg-member").remove(); return; }
   if (ev.target.classList.contains("vg-save")) { saveVoiceGroups(); return; }
 });
+
+// --- 列表搜索（音色库 / 音色分组）--------------------------------------------
+// 用显示/隐藏而不是重渲染：分组面板每一行都是可编辑表单（分组名/默认音色/备注/成员），
+// 重新渲染会摧毁用户正在输入的内容，也会丢掉未保存的新建分组。
+function listHaystack(rec) {
+  if (rec.querySelector(".vg-name")) {
+    // 分组行：分组名 + 备注 + 默认音色 + 每个成员（音色/子标签/备注）
+    const selText = (s) => rec.querySelector(s)?.selectedOptions[0]?.textContent || "";
+    const members = [...rec.querySelectorAll(".vg-member")].map((m) => {
+      const mv = m.querySelector(".vg-mvoice")?.selectedOptions[0]?.textContent || "";
+      return `${mv} ${m.querySelector(".vg-mtag")?.value || ""} ${m.querySelector(".vg-mnote")?.value || ""}`;
+    }).join(" ");
+    return `${rec.querySelector(".vg-name").value} ${rec.querySelector(".vg-note")?.value || ""} ${selText(".vg-default")} ${members}`.toLowerCase();
+  }
+  // 音色行：名称 + 备注 + 逐字稿 + 各种徽章（时长/预处理/ASR）
+  const chips = [...rec.querySelectorAll(".chip")].map((c) => c.textContent).join(" ");
+  const note = rec.querySelector(".vnote")?.value || "";
+  const ref = rec.querySelector(".text")?.textContent || "";
+  return `${chips} ${note} ${ref}`.toLowerCase();
+}
+
+function applyListSearch(listId) {
+  const list = $(listId);
+  const box = document.querySelector(`[data-search-for="${listId}"]`);
+  if (!list || !box) return;
+  const q = box.value.trim().toLowerCase();
+  const recs = [...list.querySelectorAll(".rec")];
+  let shown = 0;
+  for (const rec of recs) {
+    const hit = !q || listHaystack(rec).includes(q);
+    rec.classList.toggle("is-hidden", !hit);
+    if (hit) shown++;
+  }
+  const stat = $(listId + "SearchStat");
+  if (stat) stat.textContent = q && recs.length ? `匹配 ${shown} / ${recs.length}` : "";
+  let none = $(listId + "SearchNone");
+  if (q && recs.length && !shown) {
+    if (!none) {
+      none = document.createElement("div");
+      none.id = listId + "SearchNone";
+      none.className = "empty";
+      list.appendChild(none);
+    }
+    none.textContent = `没有匹配「${q}」的条目`;
+    none.classList.remove("is-hidden");
+  } else if (none) {
+    none.classList.add("is-hidden");
+  }
+}
+
+function wireListSearch(listId) {
+  const box = document.querySelector(`[data-search-for="${listId}"]`);
+  if (!box) return;
+  box.addEventListener("input", () => applyListSearch(listId));
+  const clear = box.parentElement.querySelector(".search-clear");
+  if (clear) clear.onclick = () => { box.value = ""; applyListSearch(listId); box.focus(); };
+}
+wireListSearch("vcList");
+wireListSearch("vgList");
 
 </script>
 </body>
