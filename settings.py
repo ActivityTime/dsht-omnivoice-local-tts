@@ -178,21 +178,36 @@ SETTINGS: dict[str, dict[str, Any]] = {
     # --- 短句长度补偿（见 server._auto_duration）----------------------------
     "OMNI_TTS_AUTO_DURATION": {
         "default": "1", "kind": "bool", "group": "generation", "live": True,
-        "desc": "短句自动补时长。**默认开**：模型会提前约 1.4 秒收尾（实测），"
-                "让短句只剩一点点声音；开启后按文本估算长度并显式传给模型，"
-                "长句（自身预算已够）不受影响。请求里显式给了 duration 时不介入。",
+        "desc": "短句/多停顿文本自动补时长。**默认开**：上游按字符权重估的预算对停顿"
+                "（标点/空格）与非中文文本系统性低估，导致偶发句尾截断；开启后在上游预算"
+                "基础上加相对安全余量、并对每个停顿显式补时，再传给模型。"
+                "请求里显式给了 duration 时不介入。",
     },
     "OMNI_TTS_AUTO_DURATION_RATE": {
         "default": "65", "kind": "float", "group": "generation", "live": True,
         "min": 30.0, "max": 150.0,
         "desc": "目标语速：每个「字符权重」折算的毫秒数（汉字权重 3.0 → 约 195 ms/字）。"
-                "**越大越慢**：65 ≈ 中文 5 字/秒；调小变快、调大变慢。",
+                "**越大越慢**：65 ≈ 中文 5 字/秒；调小变快、调大变慢。作为基础启发式，"
+                "最终时长还会叠加安全余量与停顿补偿。",
     },
     "OMNI_TTS_AUTO_DURATION_LEAD": {
         "default": "1.4", "kind": "float", "group": "generation", "live": True,
         "min": 0.0, "max": 5.0,
-        "desc": "模型提前收尾的秒数补偿，仅对克隆音色生效（文字造声路径不提前收尾）。"
-                "觉得补得过头就调小，觉得仍被截断就调大。",
+        "desc": "克隆音色的固定秒数补偿（文字造声路径不加）。覆盖克隆 prompt 仍可能残留的"
+                "短读倾向。觉得补得过头就调小，觉得仍被截断就调大。",
+    },
+    "OMNI_TTS_AUTO_DURATION_MARGIN": {
+        "default": "0.12", "kind": "float", "group": "generation", "live": True,
+        "min": 0.0, "max": 1.0,
+        "desc": "相对安全余量：在上游自身预算上额外加的比例（0.12 = +12%）。作为内容自适应"
+                "地板，保证任何文本都不会拿到低于「模型自估×1.12」的时长，兜住权重表的"
+                "系统性低估。",
+    },
+    "OMNI_TTS_AUTO_DURATION_PAUSE": {
+        "default": "0.12", "kind": "float", "group": "generation", "live": True,
+        "min": 0.0, "max": 2.0,
+        "desc": "每个停顿字符（标点/空格/分隔符，按 Unicode P、Z 类计）额外补的秒数。"
+                "权重表给标点/空格几乎 0 时长，但实际朗读要停顿；多标点文本靠它补回。",
     },
     # --- storage -----------------------------------------------------------
     "OMNI_TTS_HISTORY_DIR": {
@@ -202,6 +217,11 @@ SETTINGS: dict[str, dict[str, Any]] = {
     "OMNI_TTS_CLONE_DIR": {
         "default": "voices", "kind": "path", "group": "storage", "live": False,
         "desc": "声音克隆音色库目录（.pt prompt + 原始参考音频）。",
+    },
+    "OMNI_VOICE_GROUPS": {
+        "default": "voice_groups.json", "kind": "path", "group": "storage", "live": False,
+        "desc": "音色分组配置文件（同角色多情绪）。默认位于服务同目录下的 voice_groups.json，"
+                "可用此环境变量改到别处。改后需重启服务。",
     },
     "OMNI_TTS_RECORD_DIR": {
         "default": "records", "kind": "path", "group": "storage", "live": False,

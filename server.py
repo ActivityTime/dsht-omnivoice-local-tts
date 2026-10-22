@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import unicodedata
 import sys
 import threading
 import time
@@ -1099,7 +1100,16 @@ def _frame_rate() -> float:
 
 
 def _auto_duration(text: str, clone: Any, speed: float | None) -> float | None:
-    """A `duration` that leaves the model room to finish a short line."""
+    """A `duration` that leaves the model room to finish a short / pause-heavy line.
+
+    The upstream budget (estimate_duration) is a character-weight rule whose table
+    under-weights pauses (punctuation=0.5, space=0.2) and non-CJK scripts. A line
+    full of commas, or spelled-out numbers ("2024" -> "两千零二十四"), gets a
+    budget shorter than its real spoken length and the tail is cut. We keep the
+    existing weight*rate + lead heuristic as a base, then add (a) explicit per-pause
+    time and (b) a content-aware floor = upstream estimate * (1 + margin), so those
+    lines are no longer under-budgeted.
+    """
     if not _as_bool(os.environ.get("OMNI_TTS_AUTO_DURATION", "1")):
         return None
     est_obj = _duration_estimator()
@@ -1127,11 +1137,28 @@ def _auto_duration(text: str, clone: Any, speed: float | None) -> float | None:
     try:
         rate = float(os.environ.get("OMNI_TTS_AUTO_DURATION_RATE", "65"))
         lead = float(os.environ.get("OMNI_TTS_AUTO_DURATION_LEAD", "1.4"))
+        margin = float(os.environ.get("OMNI_TTS_AUTO_DURATION_MARGIN", "0.12"))
+        pause_sec = float(os.environ.get("OMNI_TTS_AUTO_DURATION_PAUSE", "0.12"))
     except ValueError:
         return None
 
-    budget = est / _frame_rate()
+    budget = est / _frame_rate()  # upstream-estimated seconds (clone's own pace)
+    # Base heuristic (Chinese-tuned) plus a flat lead for cloned voices.
     wanted = weight * rate / 1000.0 + (lead if clone is not None else 0.0)
+    # Explicit per-pause compensation: the rule table credits punctuation/space
+    # almost no time, but they carry real pauses when spoken.
+    pauses = 0
+    for ch in text:
+        if unicodedata.category(ch).startswith(("P", "Z")):
+            pauses += 1
+    wanted += pauses * pause_sec
+    # Content-aware safety floor: hand the model at least its own estimate plus a
+    # relative margin, capped in absolute terms so long narration does not gain
+    # excessive dead air. Catches weight under-estimation the base misses.
+    extra = min(budget * margin, 2.0)
+    safe = budget + extra
+    if safe > wanted:
+        wanted = safe
     if wanted <= budget:
         return None
     return round(min(max(wanted, 0.05), 600.0), 2)
@@ -2548,6 +2575,8 @@ _LIVE_ENV_KEYS = frozenset({
     "OMNI_TTS_AUTO_DURATION",
     "OMNI_TTS_AUTO_DURATION_RATE",
     "OMNI_TTS_AUTO_DURATION_LEAD",
+    "OMNI_TTS_AUTO_DURATION_MARGIN",
+    "OMNI_TTS_AUTO_DURATION_PAUSE",
 })
 
 
