@@ -342,6 +342,17 @@ def _as_bool(value: Any) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _clone_preprocess_default() -> bool:
+    """Default of ``preprocess_prompt`` for new clones: config-driven, off by default.
+
+    Off (raw reference audio) avoids the upstream token-budget shortfall that
+    makes cloned voices sound rushed — the model then estimates duration from
+    the real, silence-inclusive clip instead of a trimmed one paired with the
+    full transcript.
+    """
+    return _as_bool(os.environ.get("OMNI_TTS_CLONE_PREPROCESS", "0"))
+
+
 def _detect_language(text: str) -> str:
     """Coarse single-language guess for `language=auto` (ISO 639-3 codes).
 
@@ -2334,6 +2345,7 @@ _LIVE_GEN_KEYS = {
 _LIVE_ENV_KEYS = frozenset({
     "OMNI_TTS_MODEL_DIRS",
     "OMNI_TTS_EMOTION_MAP_OFFICIAL",
+    "OMNI_TTS_CLONE_PREPROCESS",
     "OMNI_TTS_AUTO_DURATION",
     "OMNI_TTS_AUTO_DURATION_RATE",
     "OMNI_TTS_AUTO_DURATION_LEAD",
@@ -2745,7 +2757,7 @@ def _store_clone(
     ref_text: str | None,
     source: str,
     raw: bytes | None = None,
-    preprocess_prompt: bool = True,
+    preprocess_prompt: bool | None = None,
 ) -> dict[str, Any]:
     """Encode a voice-clone prompt and persist prompt + reference audio + meta.
 
@@ -2755,20 +2767,19 @@ def _store_clone(
     transcript lands in the returned prompt, so it is recorded in meta.json
     even though the caller supplied nothing.
 
-    `preprocess_prompt` (OmniVoice default True) trims silence in the reference
-    audio and appends a sentence-final punctuation to `ref_text` when missing.
-    Turn it off only when the raw clip must be embedded verbatim — e.g. the
-    transcript is already punctuated and the silence carries meaning.
+    `preprocess_prompt` 默认关闭（参考音频原样嵌入，上游按含静音的真实时长估算，
+    可修正『读得急/句尾截断』）。设 True 才开启去静音/裁过长/补句末标点处理。
     """
     import torch  # noqa: PLC0415
 
     model = get_model()
+    pp = preprocess_prompt if preprocess_prompt is not None else _clone_preprocess_default()
     auto_asr = not (ref_text or "").strip()
     try:
         prompt = model.create_voice_clone_prompt(
             ref_audio=(torch.from_numpy(wave).unsqueeze(0), int(sr)),
             ref_text=None if auto_asr else ref_text,
-            preprocess_prompt=preprocess_prompt,
+            preprocess_prompt=pp,
         )
     except Exception as error:  # noqa: BLE001
         log.exception("voice clone prompt failed")
@@ -2800,7 +2811,7 @@ def _store_clone(
                 "duration": round(duration, 2),
                 "sample_rate": int(sr),
                 "source": source,
-                "preprocess_prompt": bool(preprocess_prompt),
+                "preprocess_prompt": bool(pp),
                 "created": datetime.now().isoformat(timespec="seconds"),
             },
             ensure_ascii=False,
@@ -2815,7 +2826,7 @@ def _store_clone(
         duration,
         len(resolved_text),
         ", auto-transcribed" if auto_asr else "",
-        preprocess_prompt,
+        pp,
     )
     return {
         "ok": True,
@@ -2831,7 +2842,7 @@ async def admin_add_voice(
     name: str = Form(""),
     ref_text: str = Form(""),
     local_path: str = Form(""),
-    preprocess_prompt: str = Form("1"),
+    preprocess_prompt: str = Form(""),
     audio: UploadFile | None = File(None),
 ):
     """Build a clone prompt from one reference clip and store it.
@@ -2903,7 +2914,7 @@ async def admin_add_voice(
         ref_text,
         filename,
         raw=raw,
-        preprocess_prompt=_as_bool(preprocess_prompt),
+        preprocess_prompt=(_as_bool(preprocess_prompt) if preprocess_prompt else None),
     )
 
 
@@ -2913,7 +2924,7 @@ def admin_import_local(
     prefix: str = Form(""),
     limit: int = Form(20),
     overwrite: int = Form(0),
-    preprocess_prompt: str = Form("1"),
+    preprocess_prompt: str = Form(""),
     asr: int = Form(0),
 ) -> dict[str, Any]:
     """Register every clip in a local directory.
@@ -2925,7 +2936,7 @@ def admin_import_local(
     `path`       file or directory on the server host
     `prefix`     prepended to each stem to build the voice name
     `limit`      max clips to import from a directory (sorted by name)
-    `preprocess_prompt`  "0" keeps reference audio verbatim (no silence trim)
+    `preprocess_prompt`（默认 "0"）keeps reference audio verbatim (no silence trim)
     `asr`        "1" = clips without a sibling transcript are auto-transcribed
                  by the bundled Whisper ASR instead of skipped (first use
                  downloads ~1.6 GB; each clip takes a few seconds)
@@ -2944,7 +2955,7 @@ def admin_import_local(
         )[: max(1, min(200, int(limit or 20)))]
 
     prefix_clean = _safe_name(prefix, trim=False) if (prefix or "").strip() else ""
-    keep_raw = not _as_bool(preprocess_prompt)
+    pp_override = _as_bool(preprocess_prompt) if preprocess_prompt else None
     use_asr = _as_bool(asr)
     created: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
@@ -2975,7 +2986,7 @@ def admin_import_local(
             continue
         try:
             created.append(
-                _store_clone(name, wave, sr, text, f.name, raw=raw, preprocess_prompt=not keep_raw)
+                _store_clone(name, wave, sr, text, f.name, raw=raw, preprocess_prompt=pp_override)
             )
         except HTTPException as error:
             skipped.append({"file": f.name, "reason": str(error.detail)})

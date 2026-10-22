@@ -32,6 +32,7 @@ GROUPS: list[tuple[str, str]] = [
     ("limits", "保留条数与配额"),
     ("logging", "日志"),
     ("instruct", "指令与属性"),
+    ("clone", "克隆与预处理"),
 ]
 
 # name -> spec
@@ -109,6 +110,12 @@ SETTINGS: dict[str, dict[str, Any]] = {
                 "默认 1：允许，映射目标由所选映射模板决定（官方模板/微调模板）。"
                 "设 0 则屏蔽官方标签与声音属性，整张表只剩微调的语气/情绪标签"
                 "（happy/sad/angry/whisper…）。",
+    },
+    "OMNI_TTS_CLONE_PREPROCESS": {
+        "default": "0", "kind": "bool", "group": "clone", "live": True,
+        "desc": "克隆音色时对参考音频做预处理（去静音/裁过长/补句末标点）。"
+                "默认 0（关闭）：参考音频原样嵌入，上游按含静音的真实时长估算，"
+                "可修正社区普遍反馈的『读得急/句尾被截断』。设 1 才开启去静音预处理。",
     },
     "OMNI_TTS_MODEL_DIRS": {
         "default": "", "kind": "str", "group": "model", "live": True,

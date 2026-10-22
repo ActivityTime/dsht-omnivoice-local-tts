@@ -272,18 +272,18 @@ curl http://127.0.0.1:8890/health
 
 进程内另有 `dict` 缓存已加载的 prompt，命中即不再读盘；**服务重启不丢失**（落在磁盘上）。
 
-**`preprocess_prompt`（默认开）**
+**`preprocess_prompt`（默认关）**
 
 OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的静音、超 20s 的按最大静音间隙切短、
-逐字稿末尾补一个句末标点。管理台克隆卡片有勾选框；关掉（`preprocess_prompt=0`）= 原样嵌入，
+逐字稿末尾补一个句末标点。管理台克隆卡片有勾选框（默认不勾，即原样嵌入）；勾选（`preprocess_prompt=1`）才做去静音预处理，
 仅用于逐字稿已带标点且静音本身有意义的场景。生成端点不暴露此字段——我们恒走预建好的
 `voice_clone_prompt`，该字段只在建 prompt 时起作用。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/voices` | 音色库列表（只读元信息，不加载 prompt） |
-| POST | `/admin/voices` | `name`（可空）+ `local_path`（服务端读盘）+ `ref_text`（可空：同目录同名文本 → 找不到走 ASR）+ `preprocess_prompt`（`"1"`/`"0"`，默认 `"1"`）；`audio` 上传字段仍兼容（`ref_text` 可空，直走 ASR） |
-| POST | `/admin/import-local` | `path`（目录或文件）+ `prefix` + `limit` + `preprocess_prompt` + `asr`（`"1"`=无逐字稿的也自动转写，默认跳过）：批量注册 |
+| POST | `/admin/voices` | `name`（可空）+ `local_path`（服务端读盘）+ `ref_text`（可空：同目录同名文本 → 找不到走 ASR）+ `preprocess_prompt`（`"1"`/`"0"`，默认 `"0"`）；`audio` 上传字段仍兼容（`ref_text` 可空，直走 ASR） |
+| POST | `/admin/import-local` | `path`（目录或文件）+ `prefix` + `limit` + `preprocess_prompt`（默认 `"0"`，原样嵌入） + `asr`（`"1"`=无逐字稿的也自动转写，默认跳过）：批量注册 |
 | POST | `/admin/pick-path` | `{"mode":"file"|"dir","title","initial_dir"}`：服务端弹原生选择框，返回选中路径（空=取消） |
 | DELETE | `/admin/voices/{name}` | 删除音色及其参考音频 |
 | GET | `/admin/voices/{name}/audio` | 回听原始参考音频 |
