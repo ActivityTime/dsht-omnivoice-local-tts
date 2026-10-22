@@ -56,7 +56,7 @@ DSHT 配音配置：
 | 项 | 要求 |
 |---|---|
 | 参考音频 | 3–10 秒（>20 秒官方警告：更慢、更占内存、质量下降），wav/mp3/flac/ogg |
-| `ref_text` | **必填**，参考音频的逐字稿。留空会触发 Whisper ASR 自动转写（多占约 3 GB，本机不划算） |
+| `ref_text` | **必填**，参考音频的逐字稿。留空会触发 Whisper ASR 自动转写（额外加载约 3 GB 模型、更慢）；填逐字稿可跳过 ASR |
 | 音色名称 | 创建后，`voice` 字段填这个名字即可使用（DSHT 里一样） |
 
 每个音色在 `voices/` 下存三个文件：`<name>.pt`（官方 `VoiceClonePrompt.save()` 产物，约 7 KB）、
@@ -93,8 +93,11 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 |---|---|---|
 | `server.py` | FastAPI OpenAI 兼容 TTS 服务 | ✅ |
 | `admin.html` | 管理控制台页面（自包含，无外链） | ✅ |
+| `emotion_map.py` | 情绪标签映射与模板组（DSHT 适配层） | ✅ |
+| `settings.py` | 配置清单与默认值（settings registry） | ✅ |
 | `start.cmd` | Windows 启动器 | ✅ |
 | `voices.json` | 音色 → 文字造声属性映射 | ✅ |
+| `voice_groups.json` | 音色分组配置（同角色多情绪） | ✅ |
 | `download_model.py` | 从 hf-mirror 拉取模型 | ✅ |
 | `requirements.txt` | Python 依赖 | ✅ |
 | `setup.ps1` | 全新机器自举脚本 | ✅ |
@@ -118,14 +121,14 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 | Python / Web 框架 | **上游**：python.org、FastAPI 等 | embeddable CPython 3.13.2、fastapi、uvicorn、lameenc、soundfile |
 | OpenAI 兼容服务层 | **本项目** | `server.py`：端点、参数解析、鉴权、克隆缓存、归档 |
 | 管理控制台 | **本项目** | `admin.html`：自包含单文件页面 |
-| 音色与参数映射 | **本项目** | `voices.json`（OpenAI 音色名 → 造声属性） |
+| 音色与参数映射 | **本项目** | `voices.json`（OpenAI 音色名 → 造声属性）、`emotion_map.py`（DSHT 情绪指令 → 标签 → 模板组映射）、`voice_groups.json`（分组名 → 成员 / 默认音色） |
 | 启动与自举 | **本项目** | `start.cmd`、`setup.ps1`、`download_model.py` |
 | 文档 | **本项目** | `README.md`、`USAGE.md` |
 
 我们实际新增的东西（上游没有的）：
 
 1. **OpenAI 兼容适配层**——让 DSHT 原生 `openai` 配音 provider 无需插件直连。
-2. **`voice` 字段双语义**——命中 `voices.json` 走映射，未命中整串当造声属性透传。
+2. **`voice` 字段多语义**——命中克隆名直接用该音色；命中分组名按情绪标签选组内成员（无标签取默认）；命中 `voices.json` 走造声属性映射；都不命中则整串当造声属性透传。情绪来自 DSHT 指令（`用X的语气说这句话。`）经映射层解析，不写在 `voice` 字段里。
 3. **声音克隆接入**——上传参考音频建 prompt，落盘 `.pt` + 内存缓存，与属性造声互斥共存。
 4. **请求归档与回放**——每次请求（含失败）落 `history/<id>/`，可试听、下载、复用参数。
 5. **管理控制台**——自包含、无 CDN、离线可用。
@@ -133,6 +136,13 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 7. **Windows DLL 加载修复链**——`api-ms-win-crt → ucrtbase` 改写、`vcomp140` 副本、`add_dll_directory` 补全。
 8. **torio stub 与 dist-info 补齐**——torchaudio 2.8 拆分 io 后端后的兼容处理。
 9. **自包含打包**——官方 embeddable Python 内嵌进项目，整目录可搬、不依赖外部 Python。
+10. **情绪标签映射（DSHT 适配层）**——解析 DSHT 发送的「用X的语气说这句话。」→ 英文标签 → 模板组（官方 / 微调 / 自定义）映射 → 克隆音色或声音属性；管理台含映射面板，可导入 / 保存 / 应用模板组。
+11. **短句长度补偿**——`_auto_duration` 按文本估长 + `LEAD` 安全余量（`OMNI_TTS_AUTO_DURATION*` 旋钮），消除短台词被截尾。
+12. **克隆预处理可配置**——`preprocess_prompt` 默认关闭（参考音频原样嵌入），直接消除"读得急"；`OMNI_TTS_CLONE_PREPROCESS` 为可保存开关。
+13. **系统托盘图标**——左键开管理台、右键复制端点 / 退出。
+14. **模型运行时切换**——`/admin/models` 切换 base / en 等并持久化。
+15. **配置页面与持久化**——`settings.py` registry + `runtime_config.json`，保存即时生效（live）。
+16. **备注字段**——分组、成员、独立克隆均可加备注。
 
 > 仓库里的 `README_upstream.md` 与 `voice-design_upstream.md` 是**留存的上游文档**，不是本项目作品。
 
