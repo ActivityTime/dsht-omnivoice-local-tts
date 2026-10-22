@@ -277,14 +277,25 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 > clone 与 instruct 是 if/else 二选一）。
 > DSHT 侧无感——voice 字段填克隆音色名即可，走的还是同一个 OpenAI 端点。
 >
-> ⚠️ **但这是本机服务的选择，不是 OmniVoice 库的限制。** 库层面**两者可以共存**：
-> `omnivoice/models/omnivoice.py:1222-1228` 把 `<|instruct_start|>...<|instruct_end|>`
-> **无条件**写进 style token，参考音频是**另外一段**拼接进去的（1254-1258 行），
-> 所以模型能同时看到音色与属性描述。实测（`scratch/verify_instruct_modulates_clone.py`）：
-> 给同一个克隆分别加 `male, low pitch` / `female, high pitch`，**F0 会真实改变**
-> （女声克隆 + `male, low pitch` → F0 从 324 Hz 掉到 113 Hz，降幅 65%）。
-> → 想要「克隆音色 + 属性微调」，直接用 `omnivoice` 库调 `generate(voice_clone_prompt=...,
-> instruct=...)` 即可，本机服务目前不开放这条组合。
+> **克隆音色与文字属性可以同时使用**（2026-10-22 起）。
+>
+> - **怎么传**：`voice` 填克隆音色名，属性写在 `instructions` 字段
+>   （管理台：「声音」填克隆名 + 「附加属性」填属性串，并**勾选**「附加指令拼入属性串」）。
+> - **效果**：属性会**叠加在克隆音色之上**，实测把克隆的音高从 308 Hz 压到 118 Hz
+>   （`male, low pitch`），或抬到 338 Hz（`female, high pitch`）。
+> - **只取白名单属性项**：非属性内容（如 DSHT 的情绪短语「温柔地」）会被**丢弃而非报错**，
+>   请求照常成功——情绪短语本来就不在 voice-design 白名单里。
+> - **中英混写会自动统一到单一语种**（有中文项则统一为中文），避免触发上游的混写校验。
+> - **显式关闭**：请求里带 `use_instructions: 0` 可禁用（端点支持该参数）；
+>   管理台取消勾选即禁用。
+>
+> ⚠️ 与**纯文字造声**模式的差异：design 模式下 `instructions` 仍受
+> `OMNI_TTS_USE_INSTRUCTIONS` 开关约束（默认关闭，**向后兼容不变**）；
+> 克隆模式下默认启用，因为克隆没有"基础属性串"可供"附加"，属性只能走 `instructions`。
+>
+> ⚠️ 属性是**相对参考音色的偏移**，不是绝对设定：参考音色已满足某属性时位移趋近于零
+> （给女声克隆加 `female, high pitch` 几乎不动）。**想改克隆的性别/音高，
+> 换参考音频比加属性更可靠。**
 
 ### 3.8 OpenAI 端点请求参数全表（`POST /v1/audio/speech`）
 

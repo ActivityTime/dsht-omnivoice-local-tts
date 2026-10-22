@@ -161,7 +161,8 @@
       <div>
         <label for="instructions">附加属性（可选）</label>
         <input id="instructions" placeholder="british accent 或 四川话">
-        <div class="hint">仅支持 OmniVoice 属性项：<b>不可中英混用</b>，不支持情绪词。勾选下方开关才生效。</div>
+        <div class="hint">仅支持 OmniVoice 属性项：<b>不可中英混用</b>，不支持情绪词。勾选下方开关才生效。<br>
+        <b>克隆音色也可带属性</b>：声音填克隆名时，勾选开关后这里的属性会叠加到克隆音色上（实测可把音高从 308 Hz 压到 118 Hz）。</div>
       </div>
       <div>
         <label for="speed">语速 speed</label>
@@ -303,6 +304,7 @@
 
     <div class="row">
       <label class="check"><input id="useInstr" type="checkbox"> 附加指令拼入属性串</label>
+      <span class="hint" style="margin:0">文字造声与<b>克隆音色都适用</b>：克隆时属性叠加在克隆音色之上。</span>
       <span class="spacer"></span>
       <button id="gen" class="primary">生成</button>
     </div>

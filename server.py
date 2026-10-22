@@ -838,6 +838,85 @@ def pick_instruct(
     return instruct.strip(" ,，")
 
 
+def _load_design_vocab() -> tuple[frozenset[str], dict[str, str], dict[str, str]]:
+    """The upstream voice-design vocabulary: valid items + EN/ZH mappings.
+
+    Imported lazily because the library lives in the bundled interpreter; a
+    missing import must not take the whole service down, so the caller gets
+    empty vocabularies and the request falls back to plain cloning.
+    """
+    try:
+        from omnivoice.utils.voice_design import (  # noqa: PLC0415
+            _INSTRUCT_ALL_VALID,
+            _INSTRUCT_EN_TO_ZH,
+            _INSTRUCT_ZH_TO_EN,
+        )
+    except Exception:  # noqa: BLE001
+        return frozenset(), {}, {}
+    return frozenset(_INSTRUCT_ALL_VALID), dict(_INSTRUCT_EN_TO_ZH), dict(_INSTRUCT_ZH_TO_EN)
+
+
+def _valid_design_items(text: str) -> list[str]:
+    """Pick the voice-design items out of a free-form string.
+
+    The upstream validator (`_resolve_instruct`) raises on any item outside
+    the whitelist. That is right for a dedicated design request, but this
+    path receives whatever the caller happened to send -- notably DSHT's
+    `instructions`, which is an emotion phrase ("温柔地") rather than a
+    design attribute. Dropping unknown items keeps a clone request working
+    instead of failing the whole call over a phrase that was never meant as
+    an instruct in the first place.
+    """
+    valid, _, _ = _load_design_vocab()
+    if not valid:
+        return []
+    items = []
+    for raw in re.split(r"\s*[,，]\s*", text or ""):
+        item = raw.strip().lower()
+        if item and item in valid and item not in items:
+            items.append(item)
+    return items
+
+
+def _voice_mode(clone: Any, instruct: str | None) -> str:
+    """Which generation path a request took: clone, design, or both."""
+    if clone is not None and instruct:
+        return "clone+design"
+    return "clone" if clone is not None else "design"
+
+
+def _instruct_for_clone(instructions: str) -> str:
+    """Build a voice-design instruct to apply on top of a cloned voice.
+
+    A clone already carries its own timbre, but the model accepts both
+    signals at once (the instruct block is written into the style tokens
+    unconditionally and the reference audio is appended separately), so a
+    design attribute can still shift the clone -- measured at up to -65% F0
+    for "male, low pitch" on a female clone.
+
+    Only whitelisted design items survive. Everything else (DSHT emotion
+    phrases, free text) is dropped rather than raised, so a request never
+    fails because of a phrase that was not a design attribute.
+
+    The surviving items are then unified into a single language, because
+    the upstream validator rejects a mixed Chinese/English instruct. The
+    Chinese set wins when both are present, mirroring the upstream rule
+    that a dialect forces Chinese.
+    """
+    items = _valid_design_items(instructions)
+    if not items:
+        return ""
+    _, en_to_zh, zh_to_en = _load_design_vocab()
+    has_zh = any(any("一" <= c <= "鿿" for c in item) for item in items)
+    if has_zh:
+        items = [en_to_zh.get(item, item) for item in items]
+        separator = "，"
+    else:
+        items = [zh_to_en.get(item, item) for item in items]
+        separator = ", "
+    return separator.join(items)
+
+
 def _clone_path(name: str) -> Path:
     """`<name>.pt` inside the clone directory; the name is validated first."""
     if not _NAME_RE.match(name or ""):
@@ -874,12 +953,17 @@ def resolve_voice(
 ) -> tuple[str | None, Any]:
     """Return `(instruct, clone)` for a voice field.
 
-    A stored clone wins over the attribute map, and the two modes are mutually
-    exclusive: cloning carries its own timbre, so no instruct is sent.
+    A stored clone wins over the attribute map. The two are no longer
+    mutually exclusive: a clone may also carry a voice-design instruct,
+    which the model applies on top of the cloned timbre (the instruct
+    block and the reference audio reach it as separate signals, so both
+    are honoured at once). Only whitelisted design items are used --
+    free-form text such as an emotion phrase is dropped, not raised.
     """
     key = (voice or "").strip()
     if key in clone_names():
-        return None, get_clone(key)
+        instruct = "" if use_instructions is False else _instruct_for_clone(instructions)
+        return (instruct or None), get_clone(key)
     return pick_instruct(key, instructions, voices, use_instructions), None
 
 
@@ -914,8 +998,11 @@ def run_generate(
             kwargs["duration"] = params["duration"]
         if clone is not None:
             kwargs["voice_clone_prompt"] = clone
-        else:
-            kwargs["instruct"] = instruct or None
+        # The instruct is sent even when a clone is present: the model takes
+        # the reference audio and the design attributes as separate signals,
+        # so a clone can be shifted by a design attribute (e.g. pitch).
+        if instruct:
+            kwargs["instruct"] = instruct
         chunks = model.generate(**kwargs)
     if not chunks:
         raise RuntimeError("model returned no audio")
@@ -1342,8 +1429,17 @@ async def speech(request: Request, authorization: str | None = Header(default=No
     num_step = gen.pop("num_step")
 
     voices_map = load_voices()
-    instruct, clone = resolve_voice(voice, instructions, voices_map)
-    voice_mode = "clone" if clone is not None else "design"
+    # `use_instructions` is tri-state here: absent -> the clone+design
+    # combination is allowed by default (a clone has no base attribute
+    # string for extra attributes to be "appended" to, and only whitelisted
+    # design items survive anyway), 0 -> explicitly off, 1 -> on.
+    use_instr = body.get("use_instructions")
+    if use_instr is None:
+        use_instr_arg: bool | None = None
+    else:
+        use_instr_arg = bool(use_instr)
+    instruct, clone = resolve_voice(voice, instructions, voices_map, use_instr_arg)
+    voice_mode = _voice_mode(clone, instruct)
     client = request.client.host if request.client else ""
     started = time.perf_counter()
 
@@ -2434,7 +2530,7 @@ async def admin_generate(request: Request):
         "source": "admin",
         "text": text,
         "voice": voice,
-        "voice_mode": "clone" if clone is not None else "design",
+        "voice_mode": _voice_mode(clone, instruct),
         "instructions": instructions,
         "instruct": instruct,
         "use_instructions": use_instr,
