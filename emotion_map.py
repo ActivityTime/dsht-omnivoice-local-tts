@@ -34,6 +34,46 @@ HERE = Path(__file__).resolve().parent
 
 MAP_FILENAME = "emotion_map.json"
 
+# The two families of inline tags, and why they are treated differently.
+#
+# The 13 official symbols are *non-verbal events* -- laughing, sighing, an
+# "ah?" of surprise. They are loud: tagging a line with them makes the
+# model produce the sound itself, which swamps the speaker's voice. The
+# finetune's eight are delivery and emotion (happy, sad, whisper, calm…)
+# and leave the timbre alone.
+#
+# So the default policy maps onto the finetune tags only, and treats the
+# official symbols -- and voice-design attributes, which change the voice
+# itself -- as blocked. `OMNI_TTS_EMOTION_MAP_OFFICIAL=1` lifts that.
+OFFICIAL_INLINE_TAGS: tuple[str, ...] = (
+    "laughter", "sigh", "confirmation-en", "question-en", "question-ah",
+    "question-oh", "question-ei", "question-yi", "surprise-ah",
+    "surprise-oh", "surprise-wa", "surprise-yo", "dissatisfaction-hnn",
+)
+FINETUNE_INLINE_TAGS: tuple[str, ...] = (
+    "singing", "happy", "sad", "angry", "nervous", "whisper", "calm", "excited",
+)
+
+
+def official_enabled() -> bool:
+    """Whether mappings may point at official symbols and attributes."""
+    raw = str(os.environ.get("OMNI_TTS_EMOTION_MAP_OFFICIAL", "0")).strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def blocked_targets(valid_design: frozenset[str]) -> frozenset[str]:
+    """Targets the current policy refuses: attributes, plus official tags.
+
+    The finetune's own tags are never blocked, even when a name is also a
+    voice-design attribute: `whisper` is an attribute on the base
+    checkpoint *and* one of the finetune's delivery tags, and blocking it
+    would take away the quiet half of the table for no good reason.
+    """
+    blocked = set(valid_design) - set(FINETUNE_INLINE_TAGS)
+    if not official_enabled():
+        blocked |= set(OFFICIAL_INLINE_TAGS)
+    return frozenset(blocked)
+
 # DSH-Tavern does not send a bare emotion word: its "OpenAI compatible"
 # channel wraps the annotated emotion into one fixed sentence, built by
 # `emotionStyle()` in the tavern plugin as
@@ -65,15 +105,14 @@ def map_path() -> Path:
     return Path(os.environ.get("OMNI_EMOTION_MAP", HERE / MAP_FILENAME))
 
 
-# The default table, used when no file exists yet. These are the emotion
-# words a role-play front end tends to send, mapped to the closest thing
-# OmniVoice can express.
+# The default table, used when no file exists yet.
 #
-# Note which entries only work on the emotion finetune: the base checkpoint
-# has no emotion axis, so "happy" and friends can only be honoured when
-# that model is loaded. "whisper" and the 13 upstream symbols work on both.
+# Everything a role-play front end sends -- DSH-Tavern's 28 emotions above
+# all -- is mapped onto the finetune's delivery tags, which colour the line
+# without replacing the speaker's voice. Entries are one target per phrase:
+# a phrase cannot carry both a quiet tag and a loud one.
 DEFAULT_MAPPING: dict[str, list[str]] = {
-    # --- voice quality (available on every checkpoint) ---
+    # --- delivery: quiet / intimate (finetune tag `whisper`) ---
     "耳语": ["whisper"],
     "耳語": ["whisper"],
     "轻声": ["whisper"],
@@ -86,17 +125,82 @@ DEFAULT_MAPPING: dict[str, list[str]] = {
     "小声": ["whisper"],
     "慵懒": ["whisper"],
     "懒洋洋": ["whisper"],
-    # --- non-verbal sounds (available on every checkpoint) ---
-    "笑": ["laughter"],
+    # DSHT: 关心 / 渴望 / 害羞 / 爱慕
+    "关心": ["whisper"],
+    "渴望": ["whisper"],
+    "害羞": ["whisper"],
+    "爱慕": ["whisper"],
+    # --- emotion (finetune only) ---
+    "开心": ["happy"],
+    "高兴": ["happy"],
+    "愉快": ["happy"],
+    "喜悦": ["happy"],
+    # DSHT: 钦佩 / 逗乐 / 赞同 / 感激 / 得意
+    "钦佩": ["happy"],
+    "逗乐": ["happy"],
+    "赞同": ["happy"],
+    "感激": ["happy"],
+    "得意": ["happy"],
+    "兴奋": ["excited"],
+    "激动": ["excited"],
+    "雀跃": ["excited"],
+    # DSHT: 好奇 / 期待
+    "好奇": ["excited"],
+    "期待": ["excited"],
+    "难过": ["sad"],
+    "伤心": ["sad"],
+    "悲伤": ["sad"],
+    "低落": ["sad"],
+    "沮丧": ["sad"],
+    # DSHT: 失望 / 悲痛 / 懊悔
+    "失望": ["sad"],
+    "悲痛": ["sad"],
+    "懊悔": ["sad"],
+    "生气": ["angry"],
+    "愤怒": ["angry"],
+    "恼怒": ["angry"],
+    "发火": ["angry"],
+    "火大": ["angry"],
+    # DSHT: 烦躁 / 嫌弃
+    "烦躁": ["angry"],
+    "嫌弃": ["angry"],
+    "紧张": ["nervous"],
+    "不安": ["nervous"],
+    "焦虑": ["nervous"],
+    "忐忑": ["nervous"],
+    # DSHT: 害怕 / 困惑
+    "害怕": ["nervous"],
+    "困惑": ["nervous"],
+    "平静": ["calm"],
+    "冷静": ["calm"],
+    "淡然": ["calm"],
+    "从容": ["calm"],
+    # DSHT: 释然
+    "释然": ["calm"],
+    # --- singing ---
+    "唱歌": ["singing"],
+    "哼唱": ["singing"],
+    "歌唱": ["singing"],
+}
+
+# The loud ones: non-verbal events that take the voice over, kept out of
+# the default table on purpose and only merged in when
+# OMNI_TTS_EMOTION_MAP_OFFICIAL is on. Several name an event rather than a
+# delivery ("惊讶" is an "ah!", not a mood), which is exactly why they are
+# not what a voiced line wants by default.
+#
+# Single-character entries are avoided: "笑" would also bite into clone
+# names like "..._欢笑_疑问询问".
+OFFICIAL_MAPPING: dict[str, list[str]] = {
     "轻笑": ["laughter"],
     "偷笑": ["laughter"],
     "笑声": ["laughter"],
     "叹气": ["sigh"],
     "叹息": ["sigh"],
-    "叹息": ["sigh"],
     "惊呼": ["surprise-ah"],
     "惊讶": ["surprise-ah"],
     "驚訝": ["surprise-ah"],
+    "恍然": ["surprise-oh"],
     "疑问": ["question-ah"],
     "疑惑": ["question-ah"],
     "不解": ["question-ah"],
@@ -104,36 +208,19 @@ DEFAULT_MAPPING: dict[str, list[str]] = {
     "肯定": ["confirmation-en"],
     "不屑": ["dissatisfaction-hnn"],
     "不满": ["dissatisfaction-hnn"],
-    # --- emotions (need the emotion finetune) ---
-    "开心": ["happy"],
-    "高兴": ["happy"],
-    "愉快": ["happy"],
-    "喜悦": ["happy"],
-    "兴奋": ["excited"],
-    "激动": ["excited"],
-    "雀跃": ["excited"],
-    "难过": ["sad"],
-    "伤心": ["sad"],
-    "悲伤": ["sad"],
-    "低落": ["sad"],
-    "沮丧": ["sad"],
-    "生气": ["angry"],
-    "愤怒": ["angry"],
-    "恼怒": ["angry"],
-    "发火": ["angry"],
-    "火大": ["angry"],
-    "紧张": ["nervous"],
-    "不安": ["nervous"],
-    "焦虑": ["nervous"],
-    "忐忑": ["nervous"],
-    "平静": ["calm"],
-    "冷静": ["calm"],
-    "淡然": ["calm"],
-    "从容": ["calm"],
-    "唱歌": ["singing"],
-    "哼唱": ["singing"],
-    "歌唱": ["singing"],
 }
+
+
+def default_table() -> dict[str, list[str]]:
+    """The built-in table: the quiet tags and the loud ones.
+
+    The loud entries are written out even though the default policy blocks
+    them, so that turning `OMNI_TTS_EMOTION_MAP_OFFICIAL` on has something
+    to enable without a reset; the console marks them as blocked.
+    """
+    table = {key: list(value) for key, value in DEFAULT_MAPPING.items()}
+    table.update({key: list(value) for key, value in OFFICIAL_MAPPING.items()})
+    return table
 
 
 def _normalise(entry: Any) -> list[str]:
@@ -162,7 +249,7 @@ def load_map() -> dict[str, list[str]]:
                     out[key_text] = targets
             if out:
                 return out
-    return {key: list(value) for key, value in DEFAULT_MAPPING.items()}
+    return default_table()
 
 
 def save_map(table: dict[str, list[str]]) -> None:
@@ -182,8 +269,27 @@ def save_map(table: dict[str, list[str]]) -> None:
 def ensure_map() -> dict[str, list[str]]:
     """Write the default table out on first run so it can be edited."""
     if not map_path().exists():
-        save_map({key: list(value) for key, value in DEFAULT_MAPPING.items()})
+        save_map(default_table())
     return load_map()
+
+
+def _mask_protected(text: str, protected: tuple[str, ...]) -> str:
+    """Blank out the spans that belong to names, keeping every index.
+
+    A clone called `ja_Kotori_0015_欢笑_疑问询问` contains 欢笑 and 疑问, and
+    the table knows 疑问. Matching inside a name would eat the name, so
+    anything the caller has already identified is punched out first. The
+    replacement is the same length, so the offsets still line up with the
+    original string.
+    """
+    masked = text
+    for name in sorted({str(item) for item in protected if str(item)}, key=len, reverse=True):
+        needle = name.lower()
+        start = masked.lower().find(needle)
+        while start != -1:
+            masked = masked[:start] + "\u0000" * len(name) + masked[start + len(name) :]
+            start = masked.lower().find(needle)
+    return masked
 
 
 def extract(
@@ -191,14 +297,22 @@ def extract(
     table: dict[str, list[str]],
     inline_tags: tuple[str, ...],
     valid_design: frozenset[str],
-) -> tuple[str, list[str], list[str], list[str]]:
+    protected: tuple[str, ...] = (),
+    blocked: frozenset[str] = frozenset(),
+) -> tuple[str, list[str], list[str], list[str], list[dict[str, str]]]:
     """Pull the mapped emotion phrases out of a free-form string.
 
     Returns `(residual_text, inline_tags, design_items, unmatched, mapped)`.
     The residual is what is left after the matched phrases are taken out,
     and it is what should go through normal attribute parsing. `unmatched`
-    holds phrases the table knows but the loaded checkpoint cannot express;
-    `mapped` records what was translated and into what.
+    holds phrases the table knows but the loaded checkpoint cannot express
+    or the current policy blocks; `mapped` records what was translated and
+    into what.
+
+    `protected` names spans that must not be matched into -- clone names,
+    presets, tags and attributes already recognised elsewhere. `blocked`
+    names targets the policy refuses (attributes, and the official symbols
+    unless enabled).
     """
     if not text or not table:
         return text or "", [], [], [], []
@@ -213,6 +327,9 @@ def extract(
     # Longest phrase first, so "温柔地" wins over "温柔" when both are
     # present and they map to different things.
     keys = sorted(table, key=len, reverse=True)
+    # Match against the masked copy so a phrase can never land inside a
+    # name; the offsets are the same, so the cuts below hit the real text.
+    masked = _mask_protected(residual, protected)
     inline: list[str] = []
     design: list[str] = []
     unmatched: list[str] = []
@@ -220,9 +337,11 @@ def extract(
     claimed: list[tuple[str, int, int]] = []
 
     for key in keys:
-        if not key or key not in residual:
+        if not key:
             continue
-        start = residual.find(key)
+        start = masked.find(key)
+        if start < 0:
+            continue
         claimed.append((key, start, start + len(key)))
 
     # Keep the earliest longest matches and drop overlaps, so a phrase is
@@ -241,7 +360,7 @@ def extract(
         resolved: list[str] = []
         for target in targets:
             name = str(target).strip().lower()
-            if not name:
+            if not name or name in blocked:
                 continue
             if name in inline_tags:
                 if name not in inline:
@@ -269,6 +388,7 @@ def describe(
     table: dict[str, list[str]],
     inline_tags: tuple[str, ...],
     valid_design: frozenset[str],
+    blocked: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """The table as the console shows it, with per-target availability."""
     out: list[dict[str, Any]] = []
@@ -277,7 +397,9 @@ def describe(
         rows = []
         for target in targets:
             name = str(target).strip().lower()
-            if name in inline_tags:
+            if name in blocked:
+                kind, available = "blocked", False
+            elif name in inline_tags:
                 kind, available = "inline", True
             elif name in valid_design:
                 kind, available = "design", True

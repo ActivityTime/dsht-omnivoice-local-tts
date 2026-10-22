@@ -103,6 +103,12 @@ SETTINGS: dict[str, dict[str, Any]] = {
         "default": "model_config.json", "kind": "path", "group": "model", "live": False,
         "desc": "模型注册表文件（运行时状态，不入库）。",
     },
+    "OMNI_TTS_EMOTION_MAP_OFFICIAL": {
+        "default": "0", "kind": "bool", "group": "instruct", "live": True,
+        "desc": "情绪映射是否允许指向官方非语言标签（笑/叹息/惊呼/疑问…）与声音属性。"
+                "默认 0：这些标签会让模型真的发出笑声、叹息，音色变化很大，"
+                "默认只映射到微调的语气/情绪标签（happy/sad/angry/whisper…）。设 1 放开。",
+    },
     "OMNI_TTS_MODEL_DIRS": {
         "default": "", "kind": "str", "group": "model", "live": True,
         "desc": "追加的模型扫描目录，多个用 ; 分隔。改后立即生效（下次扫描时）。",

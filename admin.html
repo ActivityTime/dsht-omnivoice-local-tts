@@ -1476,6 +1476,7 @@ const EM_REMOVED = new Set();
 function emTargetLabel(t) {
   if (t.kind === "inline") return "行内标签";
   if (t.kind === "design") return "属性";
+  if (t.kind === "blocked") return "已禁用";
   return "未知";
 }
 
@@ -1484,7 +1485,8 @@ function renderEmotionMap(data) {
   EM_TARGETS = data.targets || [];
   const avail = (data.inline_tags || []).length;
   $("emStats").textContent =
-    `${EM_ROWS.length} 条映射 · 当前模型支持 ${avail} 个行内标签`;
+    `${EM_ROWS.length} 条映射 · 当前模型支持 ${avail} 个行内标签 · ` +
+    `官方标签与属性${data.official_enabled ? "已启用" : "已禁用"}（配置页可切换）`;
 
   const needle = ($("emFilter").value || "").trim().toLowerCase();
   const onlyUnusable = $("emOnlyUnusable").checked;
@@ -1504,7 +1506,11 @@ function renderEmotionMap(data) {
     } else {
       const chips = m.targets.map((t) => {
         const cls = t.available ? "tag on" : "tag warn";
-        const note = t.available ? emTargetLabel(t) : "当前模型不可用";
+        const note = t.available
+          ? emTargetLabel(t)
+          : t.kind === "blocked"
+            ? "策略禁用：官方标签/属性，可在配置页开启"
+            : "当前模型不可用";
         return `<span class="${cls}">${esc(t.name)} · ${esc(note)}</span>`;
       }).join(" ");
       targetsHtml = `<div class="chips" style="margin:0">${chips || "<span class='meta'>（无目标）</span>"}</div>`;

@@ -1002,15 +1002,22 @@ def _voice_mode(clone: Any, instruct: str | None) -> str:
 # request so the console can show what happened to each item.
 
 # The base checkpoint understands the 13 upstream non-verbal symbols.
-OFFICIAL_INLINE_TAGS = (
-    "laughter", "sigh", "confirmation-en", "question-en", "question-ah",
-    "question-oh", "question-ei", "question-yi", "surprise-ah",
-    "surprise-oh", "surprise-wa", "surprise-yo", "dissatisfaction-hnn",
+# Both vocabularies are owned by `emotion_map`, which needs them to build
+# its default table; the literals are only a fallback for when that import
+# failed and the adapter is unavailable anyway.
+OFFICIAL_INLINE_TAGS = tuple(
+    getattr(_emotion_map, "OFFICIAL_INLINE_TAGS", None)
+    or (
+        "laughter", "sigh", "confirmation-en", "question-en", "question-ah",
+        "question-oh", "question-ei", "question-yi", "surprise-ah",
+        "surprise-oh", "surprise-wa", "surprise-yo", "dissatisfaction-hnn",
+    )
 )
 
 # The ModelsLab singing/emotion finetune adds eight more inline tags.
-EMOTION_INLINE_TAGS = (
-    "singing", "happy", "sad", "angry", "nervous", "whisper", "calm", "excited",
+EMOTION_INLINE_TAGS = tuple(
+    getattr(_emotion_map, "FINETUNE_INLINE_TAGS", None)
+    or ("singing", "happy", "sad", "angry", "nervous", "whisper", "calm", "excited")
 )
 
 # Which inline tags a given checkpoint understands. Keyed by a marker that
@@ -1081,12 +1088,64 @@ def _split_voice_items(text: str) -> list[str]:
     return items + tags
 
 
+def _claim_item(
+    item: str,
+    parts: VoiceParts,
+    design_items: list[str],
+    voices: dict[str, str],
+    clones: dict[str, Any],
+    inline_tags: tuple[str, ...],
+    valid: frozenset[str],
+) -> bool:
+    """Take one item as a tag, a clone, a preset or an attribute.
+
+    Returns True when the item was recognised. Names win over emotion
+    phrases: a clone called `..._欢笑_疑问询问` contains 疑问, which the
+    emotion table knows, so names have to be claimed before any phrase
+    matching runs or the name would be eaten.
+    """
+    low = item.lower()
+
+    if item.startswith("[") and item.endswith("]"):
+        tag = item[1:-1].strip().lower()
+        if tag in inline_tags:
+            if tag not in parts.inline_tags:
+                parts.inline_tags.append(tag)
+        else:
+            return False
+        return True
+
+    if item in clones:
+        if parts.clone is None:
+            parts.clone = clones[item]
+            parts.clone_name = item
+            return True
+        return False
+
+    preset = voices.get(item) or voices.get(low)
+    if preset:
+        parts.presets.append(item)
+        for sub in _split_voice_items(preset):
+            sub_low = sub.strip().lower()
+            if sub_low in valid and sub_low not in design_items:
+                design_items.append(sub_low)
+        return True
+
+    if low in valid:
+        if low not in design_items:
+            design_items.append(low)
+        return True
+
+    return False
+
+
 def parse_voice_field(
     voice: str,
     voices: dict[str, str],
     clones: dict[str, Any],
     inline_tags: tuple[str, ...],
     emotion_table: dict[str, list[str]] | None = None,
+    blocked: frozenset[str] = frozenset(),
 ) -> VoiceParts:
     """Resolve a free-form voice field into attributes, a clone and tags.
 
@@ -1094,70 +1153,55 @@ def parse_voice_field(
     attributes are still collected and applied on top of the clone, since
     the model takes both signals at once.
 
-    Emotion phrases (the adapter for DSH-Tavern's `instructions`) are
-    pulled out first, before the remainder is read as attributes: a phrase
-    like "用温柔的语气说话" is not an attribute, and reading it as one would
-    have it rejected.
+    Emotion phrases (the adapter for DSH-Tavern's `instructions`) are read
+    out of what is *left* once every name has been claimed, never out of
+    the names themselves.
     """
     valid, _, _, _ = _load_design_vocab()
     parts = VoiceParts()
     design_items: list[str] = []
 
-    residual = voice or ""
-    if emotion_table:
-        residual, mapped_inline, mapped_design, unmatched, mapped = _emotion_map.extract(
-            residual, emotion_table, inline_tags, valid
-        )
-        for tag in mapped_inline:
-            if tag not in parts.inline_tags:
-                parts.inline_tags.append(tag)
-        design_items.extend(mapped_design)
-        parts.dropped.extend(unmatched)
-        parts.emotion_mapped.extend(mapped)
-
     unknown: list[str] = []
-    for item in _split_voice_items(residual):
-        low = item.lower()
+    for item in _split_voice_items(voice or ""):
+        if not _claim_item(item, parts, design_items, voices, clones, inline_tags, valid):
+            unknown.append(item)
 
-        if item.startswith("[") and item.endswith("]"):
-            tag = item[1:-1].strip().lower()
-            if tag in inline_tags:
+    # The leftovers are where the emotion phrases live: "害羞" on its own,
+    # or DSH-Tavern's whole "用害羞的语气说这句话。".
+    leftover: list[str] = []
+    if emotion_table and unknown:
+        # Anything already recognised is off limits to phrase matching, so a
+        # phrase cannot bite into a clone name that shares its characters.
+        protected = tuple(clones) + tuple(voices) + tuple(valid) + inline_tags
+        for fragment in unknown:
+            rest, mapped_inline, mapped_design, unmatched, mapped = _emotion_map.extract(
+                fragment, emotion_table, inline_tags, valid, protected, blocked
+            )
+            for tag in mapped_inline:
                 if tag not in parts.inline_tags:
                     parts.inline_tags.append(tag)
-            else:
-                unknown.append(item)
-            continue
+            design_items.extend(mapped_design)
+            parts.dropped.extend(unmatched)
+            parts.emotion_mapped.extend(mapped)
+            if rest.strip():
+                leftover.append(rest.strip())
+        unknown = leftover
 
-        if item in clones:
-            if parts.clone is None:
-                parts.clone = clones[item]
-                parts.clone_name = item
-            else:
-                unknown.append(item)
-            continue
-
-        preset = voices.get(item) or voices.get(low)
-        if preset:
-            parts.presets.append(item)
-            for sub in _split_voice_items(preset):
-                sub_low = sub.strip().lower()
-                if sub_low in valid and sub_low not in design_items:
-                    design_items.append(sub_low)
-            continue
-
-        if low in valid:
-            if low not in design_items:
-                design_items.append(low)
-            continue
-
-        unknown.append(item)
+    # A phrase may have been sitting next to a name ("<clone> 害羞"), so
+    # what survived the phrase pass gets one more look.
+    still_unknown: list[str] = []
+    for fragment in unknown:
+        for item in _split_voice_items(fragment):
+            if not _claim_item(item, parts, design_items, voices, clones, inline_tags, valid):
+                still_unknown.append(item)
+    unknown = still_unknown
 
     # If nothing at all was understood, report the remainder as one item.
     # Splitting a sentence like "用温柔的语气说话" into "用" "的" "语气"
     # "说话" would fill the log with fragments that say nothing useful.
     if unknown and not design_items and not parts.inline_tags and parts.clone is None:
-        parts.dropped.append(residual.strip() or unknown[0])
-    else:
+        parts.dropped.append((voice or "").strip() or unknown[0])
+    elif unknown:
         parts.dropped.extend(unknown)
 
     # Unify the attribute items into a single language, the way the upstream
@@ -1222,8 +1266,12 @@ def resolve_voice(
     clones = {name: prompt for name, prompt in clones.items() if prompt is not None}
     inline_tags = _active_inline_tags()
     table = _EMOTION_TABLE if _emotion_map is not None else {}
+    # Attributes and (unless enabled) the official event symbols are not
+    # something a mapped phrase may turn into: both change the voice itself.
+    valid, _, _, _ = _load_design_vocab()
+    blocked = _emotion_map.blocked_targets(valid) if _emotion_map is not None else frozenset()
 
-    parts = parse_voice_field(voice or "", voices, clones, inline_tags, table)
+    parts = parse_voice_field(voice or "", voices, clones, inline_tags, table, blocked)
 
     # `use_instructions` is tri-state: True forces the field on, False forces
     # it off, None follows the global OMNI_TTS_USE_INSTRUCTIONS switch.
@@ -2243,6 +2291,13 @@ def _apply_live_settings(
             if to_environment:
                 _settings.mark_applied(name)
             applied.append(name)
+        elif name == "OMNI_TTS_EMOTION_MAP_OFFICIAL":
+            # Read on every request (the blocked set is rebuilt per call),
+            # so flipping it takes effect on the next line voiced.
+            os.environ[name] = raw
+            if to_environment:
+                _settings.mark_applied(name)
+            applied.append(name)
     return applied
 
 
@@ -2372,6 +2427,7 @@ def admin_emotion_map() -> dict[str, Any]:
     if _emotion_map is None:
         raise HTTPException(status_code=503, detail="emotion map unavailable")
     valid, _, _, _ = _load_design_vocab()
+    blocked = _emotion_map.blocked_targets(valid)
     inline_tags = _active_inline_tags()
     table = _emotion_map.load_map()
     return {
@@ -2380,8 +2436,10 @@ def admin_emotion_map() -> dict[str, Any]:
         "active_model": _state.get("model_id") or MODEL_CONFIG.get("active"),
         "inline_tags": list(inline_tags),
         "targets": _emotion_map.known_targets(inline_tags, valid),
-        "mappings": _emotion_map.describe(table, inline_tags, valid),
+        "mappings": _emotion_map.describe(table, inline_tags, valid, blocked),
         "count": len(table),
+        "blocked": sorted(blocked),
+        "official_enabled": _emotion_map.official_enabled(),
     }
 
 
@@ -2444,13 +2502,16 @@ async def admin_emotion_map_save(request: Request) -> dict[str, Any]:
     _EMOTION_TABLE.clear()
     _EMOTION_TABLE.update(table)
     valid, _, _, _ = _load_design_vocab()
+    blocked = _emotion_map.blocked_targets(valid)
     inline_tags = _active_inline_tags()
     return {
         "ok": True,
         "added": added,
         "removed": removed,
-        "mappings": _emotion_map.describe(table, inline_tags, valid),
+        "mappings": _emotion_map.describe(table, inline_tags, valid, blocked),
         "count": len(table),
+        "blocked": sorted(blocked),
+        "official_enabled": _emotion_map.official_enabled(),
     }
 
 
@@ -2459,18 +2520,23 @@ def admin_emotion_map_reset() -> dict[str, Any]:
     """Restore the built-in default table."""
     if _emotion_map is None:
         raise HTTPException(status_code=503, detail="emotion map unavailable")
-    table = {key: list(value) for key, value in _emotion_map.DEFAULT_MAPPING.items()}
+    # `default_table()` honours the official-tag switch, so a reset gives
+    # back exactly the policy's own defaults.
+    table = _emotion_map.default_table()
     _emotion_map.save_map(table)
     # Update in place: a plain assignment here would create a local name
     # and leave the module-level table -- the one the parser reads -- stale.
     _EMOTION_TABLE.clear()
     _EMOTION_TABLE.update(table)
     valid, _, _, _ = _load_design_vocab()
+    blocked = _emotion_map.blocked_targets(valid)
     inline_tags = _active_inline_tags()
     return {
         "ok": True,
-        "mappings": _emotion_map.describe(table, inline_tags, valid),
+        "mappings": _emotion_map.describe(table, inline_tags, valid, blocked),
         "count": len(table),
+        "blocked": sorted(blocked),
+        "official_enabled": _emotion_map.official_enabled(),
     }
 
 
