@@ -983,6 +983,85 @@ def _voice_mode(clone: Any, instruct: str | None) -> str:
     return "clone" if clone is not None else "design"
 
 
+# --- short-line duration compensation -------------------------------------
+#
+# The model stops before it has used the length it was given. Measured over
+# the clone path it emits roughly
+#
+#     (target tokens / frame rate) - 1.4 s
+#
+# -- the lead is a fixed ~1.4 s, whatever the line length. On a long line
+# that is a rounding error; on a short one it is most of the line. A
+# ten-character line measured 0.22 s of speech, about 45 characters a
+# second: the tail is simply gone. The designed-voice path does not do
+# this, so the lead is only added when a clone is in play.
+#
+# Passing an explicit duration puts the length back under our control: the
+# model fills what it is given, so asking for the wanted length plus the
+# lead lands on the wanted length. Lines whose own budget is already big
+# enough are left alone, so long lines keep the pacing they have today.
+_FALLBACK_REF_TEXT = "Nice to meet you."
+_FALLBACK_REF_TOKENS = 25
+
+
+def _duration_estimator():
+    """The estimator the loaded model uses, or a fresh one of the same kind."""
+    est = getattr(_state.get("model"), "duration_estimator", None)
+    if est is not None:
+        return est
+    try:
+        from omnivoice.utils.duration import RuleDurationEstimator  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    return RuleDurationEstimator()
+
+
+def _frame_rate() -> float:
+    try:
+        return float(_state["model"].audio_tokenizer.config.frame_rate)
+    except Exception:  # noqa: BLE001
+        return 24.0
+
+
+def _auto_duration(text: str, clone: Any, speed: float | None) -> float | None:
+    """A `duration` that leaves the model room to finish a short line."""
+    if not _as_bool(os.environ.get("OMNI_TTS_AUTO_DURATION", "1")):
+        return None
+    est_obj = _duration_estimator()
+    if est_obj is None or not text:
+        return None
+
+    ref_text = str(getattr(clone, "ref_text", "") or "")
+    ref_tokens = None
+    tokens = getattr(clone, "ref_audio_tokens", None)
+    if tokens is not None:
+        try:
+            ref_tokens = int(tokens.size(-1))
+        except Exception:  # noqa: BLE001
+            ref_tokens = None
+    if not ref_text or not ref_tokens:
+        ref_text, ref_tokens = _FALLBACK_REF_TEXT, _FALLBACK_REF_TOKENS
+
+    try:
+        est = est_obj.estimate_duration(text, ref_text, ref_tokens)
+        weight = est_obj.calculate_total_weight(text)
+    except Exception:  # noqa: BLE001
+        return None
+    if speed and speed != 1.0:
+        est = est / speed
+    try:
+        rate = float(os.environ.get("OMNI_TTS_AUTO_DURATION_RATE", "65"))
+        lead = float(os.environ.get("OMNI_TTS_AUTO_DURATION_LEAD", "1.4"))
+    except ValueError:
+        return None
+
+    budget = est / _frame_rate()
+    wanted = weight * rate / 1000.0 + (lead if clone is not None else 0.0)
+    if wanted <= budget:
+        return None
+    return round(min(max(wanted, 0.05), 600.0), 2)
+
+
 # --- voice field parsing -----------------------------------------------------
 # The voice field is a free-form string and may mix several kinds of item:
 #
@@ -1773,6 +1852,13 @@ async def speech(request: Request, authorization: str | None = Header(default=No
     # an untagged entry.
     if voice_parts.inline_prefix:
         text = f"{voice_parts.inline_prefix} {text}"
+    # Only when the caller left the length to the model: an explicit
+    # `duration` is exactly that, a decision, and is left alone.
+    if gen.get("duration") is None:
+        auto = _auto_duration(text, clone, speed)
+        if auto is not None:
+            gen["duration"] = auto
+            gen_overrides["duration"] = auto
     voice_mode = _voice_mode(clone, instruct)
     # What each item in the voice field resolved to. Kept in the archive so
     # the console can show dropped items, the matched clone and the inline
@@ -2242,6 +2328,17 @@ _LIVE_GEN_KEYS = {
     "OMNIVOICE_AUDIO_CHUNK_THRESHOLD": "audio_chunk_threshold",
 }
 
+# Settings that are not generation-config keys but are still read at the
+# point of use, so writing them into the environment is all it takes for a
+# change to land on the next request.
+_LIVE_ENV_KEYS = frozenset({
+    "OMNI_TTS_MODEL_DIRS",
+    "OMNI_TTS_EMOTION_MAP_OFFICIAL",
+    "OMNI_TTS_AUTO_DURATION",
+    "OMNI_TTS_AUTO_DURATION_RATE",
+    "OMNI_TTS_AUTO_DURATION_LEAD",
+})
+
 
 def _apply_live_settings(
     values: dict[str, str], to_environment: bool = True
@@ -2274,15 +2371,10 @@ def _apply_live_settings(
                 os.environ[name] = raw
                 _settings.mark_applied(name)
             applied.append(name)
-        elif name == "OMNI_TTS_MODEL_DIRS":
-            # Read on every scan, so setting it takes effect right away.
-            os.environ[name] = raw
-            if to_environment:
-                _settings.mark_applied(name)
-            applied.append(name)
-        elif name == "OMNI_TTS_EMOTION_MAP_OFFICIAL":
-            # Read on every request (the blocked set is rebuilt per call),
-            # so flipping it takes effect on the next line voiced.
+        elif name in _LIVE_ENV_KEYS:
+            # Read at the point of use -- on every scan, on every request,
+            # or when a line is about to be voiced -- so setting it here is
+            # all it takes for the next call to pick it up.
             os.environ[name] = raw
             if to_environment:
                 _settings.mark_applied(name)
@@ -3267,6 +3359,11 @@ async def admin_generate(request: Request):
     instruct, clone, voice_parts = resolve_voice(voice, instructions, load_voices())
     if voice_parts.inline_prefix:
         text = f"{voice_parts.inline_prefix} {text}"
+    if gen.get("duration") is None:
+        auto = _auto_duration(text, clone, speed)
+        if auto is not None:
+            gen["duration"] = auto
+            gen_overrides["duration"] = auto
     fields: dict[str, Any] = {
         "source": "admin",
         "text": text,

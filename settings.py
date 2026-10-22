@@ -168,6 +168,25 @@ SETTINGS: dict[str, dict[str, Any]] = {
         "min": 1.0, "max": 300.0,
         "desc": "预估音频超此秒数才分块。",
     },
+    # --- 短句长度补偿（见 server._auto_duration）----------------------------
+    "OMNI_TTS_AUTO_DURATION": {
+        "default": "1", "kind": "bool", "group": "generation", "live": True,
+        "desc": "短句自动补时长。**默认开**：模型会提前约 1.4 秒收尾（实测），"
+                "让短句只剩一点点声音；开启后按文本估算长度并显式传给模型，"
+                "长句（自身预算已够）不受影响。请求里显式给了 duration 时不介入。",
+    },
+    "OMNI_TTS_AUTO_DURATION_RATE": {
+        "default": "65", "kind": "float", "group": "generation", "live": True,
+        "min": 30.0, "max": 150.0,
+        "desc": "目标语速：每个「字符权重」折算的毫秒数（汉字权重 3.0 → 约 195 ms/字）。"
+                "**越大越慢**：65 ≈ 中文 5 字/秒；调小变快、调大变慢。",
+    },
+    "OMNI_TTS_AUTO_DURATION_LEAD": {
+        "default": "1.4", "kind": "float", "group": "generation", "live": True,
+        "min": 0.0, "max": 5.0,
+        "desc": "模型提前收尾的秒数补偿，仅对克隆音色生效（文字造声路径不提前收尾）。"
+                "觉得补得过头就调小，觉得仍被截断就调大。",
+    },
     # --- storage -----------------------------------------------------------
     "OMNI_TTS_HISTORY_DIR": {
         "default": "history", "kind": "path", "group": "storage", "live": False,
