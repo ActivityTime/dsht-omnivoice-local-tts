@@ -153,7 +153,9 @@
         <label for="voice">声音 / 属性描述</label>
         <input id="voice" list="voiceList" value="alloy" placeholder="alloy 或 female, elderly, 四川话">
         <datalist id="voiceList"></datalist>
-        <div class="hint">可直接填<b>预设语音名</b>（alloy/echo/fable… 见下方「预设」标签，点一下即填入，悬停看对应属性），或留空走默认 alloy；不在预设里的值当作文字造声属性直接透传。下方英文/中文标签可点选拼装属性（英文项后自动补 ", "，中文项补 "，"）。</div>
+        <div class="hint">可<b>混用</b>：预设语音名（alloy/echo…）、文字属性（female, elderly, 四川话）、克隆音色名、行内标签（[happy]）。
+        预设与属性会合成一段属性串；<b>克隆音色名</b>会走克隆并从属性串中剔除；<b>行内标签</b>会移到文本开头。
+        认不出的项会被丢弃，并在下方「API 记录」里标出丢弃了什么、命中了哪个音色、用了哪些行内标签。</div>
         <div class="chips" id="attrEn" style="margin-top:7px"></div>
         <div class="chips" id="attrZh"></div>
         <div class="chips" id="presetVoices" style="margin-top:7px"></div>
@@ -162,6 +164,7 @@
         <label for="instructions">附加属性（可选）</label>
         <input id="instructions" placeholder="british accent 或 四川话">
         <div class="hint">仅支持 OmniVoice 属性项：<b>不可中英混用</b>，不支持情绪词。勾选下方开关才生效。<br>
+        与「声音」<b>同逻辑</b>：也可写预设名 / 克隆音色名 / 行内标签，会追加合并并去重（同类属性以先出现的为准）。<br>
         <b>克隆音色也可带属性</b>：声音填克隆名时，勾选开关后这里的属性会叠加到克隆音色上（实测可把音高从 308 Hz 压到 118 Hz）。</div>
       </div>
       <div>
@@ -1003,6 +1006,17 @@ async function loadApiRecords() {
       r.elapsed_ms != null ? r.elapsed_ms + "ms" : null,
       r.bytes ? fmtBytes(r.bytes) : null
     ].filter(Boolean).map((c) => `<span class="chip">${esc(c)}</span>`).join("");
+    // What the voice field resolved to: the clone that matched, the inline
+    // tags that were recognised, and the items that were dropped.
+    const parseChips = [];
+    if (r.matched_clone) parseChips.push(`音色=${r.matched_clone}`);
+    if (r.presets && r.presets.length) parseChips.push(`预设=${r.presets.join(",")}`);
+    if (r.inline_tags && r.inline_tags.length) parseChips.push(`行内标签=${r.inline_tags.map((t) => "[" + t + "]").join("")}`);
+    if (r.instruct) parseChips.push(`属性=${r.instruct}`);
+    if (r.dropped && r.dropped.length) parseChips.push(`丢弃=${r.dropped.join(",")}`);
+    const parseHtml = parseChips.length
+      ? `<div class="chips">${parseChips.map((c) => `<span class="chip">${esc(c)}</span>`).join("")}</div>`
+      : "";
     const audio = r.audio_url ? `<audio controls src="${esc(r.audio_url)}"></audio>` : "";
     return `<div class="rec" data-id="${esc(r.id)}">
       <div class="rec-head">
@@ -1015,6 +1029,7 @@ async function loadApiRecords() {
       </div>
       <div class="text">${esc(r.text)}</div>
       <div class="chips">${chips}</div>
+      ${parseHtml}
       ${r.error ? `<div class="text" style="color:var(--err)">${esc(r.error)}</div>` : ""}
       ${audio}
       <div class="rec-actions">

@@ -97,7 +97,7 @@ python\python.exe server.py > server.log 2>&1
 | `OMNI_TTS_HOST` | `127.0.0.1` | 监听地址（改 `0.0.0.0` 可局域网共享） |
 | `OMNI_TTS_KEY` | 空 | 鉴权密钥；空 = 不校验（DSHT 留空即可） |
 | `OMNI_TTS_VOICES` | `voices.json` | 音色映射文件 |
-| `OMNI_TTS_USE_INSTRUCTIONS` | `0` | 管理台「附加属性」开关的默认值 |
+| `OMNI_TTS_USE_INSTRUCTIONS` | `1` | 是否解析 `instructions` 字段为属性项。**默认开**——解析器只保留白名单属性项，DSHT 的情绪短语（不在白名单）会被逐项丢弃，不再需要整段忽略。设 `0` 可完全关闭该字段 |
 | `OMNI_TTS_HISTORY_DIR` | `history/` | 管理台请求归档目录 |
 | `OMNI_TTS_CLONE_DIR` | `voices/` | 声音克隆音色库目录 |
 | `OMNI_TTS_LOG_API` | `1` | 兼容开关：`0` 可关闭 OpenAI 端点（`/v1/audio/speech`）归档（即使 `OMNI_API_RECORD=1`）；DSHT 逐条调用也不再写盘 |
@@ -272,12 +272,32 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 | DELETE | `/admin/voices/{name}` | 删除音色及其参考音频 |
 | GET | `/admin/voices/{name}/audio` | 回听原始参考音频 |
 
-> **本机服务里两种模式互斥**：`voice` 命中克隆音色时，属性串**不参与**生成
-> （`server.py` 的 `resolve_voice()` 命中克隆即返回 `instruct=None`，`run_generate()` 里
-> clone 与 instruct 是 if/else 二选一）。
-> DSHT 侧无感——voice 字段填克隆音色名即可，走的还是同一个 OpenAI 端点。
+> **「声音 / 属性描述」字段允许混用**（2026-10-22 起）。一个字段里可以同时写：
 >
-> **克隆音色与文字属性可以同时使用**（2026-10-22 起）。
+> | 写法 | 例子 | 处理方式 |
+> |---|---|---|
+> | 官方预设名 | `alloy`、`fable` | 展开成属性串（`voices.json`） |
+> | 文字属性 | `female, elderly, 四川话` | 直接作为属性项 |
+> | 克隆音色名 | `ja_Ganyu_0001` | **走克隆**，并从属性串中剔除 |
+> | 行内标签 | `[happy]`、`[laughter]` | **移到文本开头**，并从属性串中剔除 |
+> | 认不出的项 | `温柔地`、`[nope]` | **丢弃**，并在请求日志里标记 |
+>
+> - **不报错**：任何无法使用的项都被丢弃而不是让请求失败，音频照常产出。
+> - **请求日志标记**：`/admin/api-records` 与 `history/` 的记录里带
+>   `dropped`（丢弃了什么）、`matched_clone`（命中了哪个音色）、
+>   `inline_tags`（用了哪些行内标签）、`presets`（命中了哪些预设）、
+>   `instruct`（最终属性串），`voice_mode` 为 `clone` / `design` / `clone+design`。
+> - **行内标签按当前模型判定**：`emotion-en` 认 8 个情绪标签
+>   （`[singing] [happy] [sad] [angry] [nervous] [whisper] [calm] [excited]`）+ 官方 13 个符号；
+>   官方基座只认 13 个符号，多的会被丢弃并标记。切换模型后无需改请求。
+> - **冲突裁决**（同类属性以**先出现者**为准，其余丢弃并标记）：
+>   ① 多个克隆 → 第一个胜出；② `voice` 与 `instructions` 各有克隆 → `voice` 优先；
+>   ③ 预设与手写属性同类冲突 → 先出现者胜出；
+>   ④ `british accent` 与 `四川话` 不能共存（前者英语专用、后者中文专用）→ 丢弃 accent；
+>   ⑤ 中英混写 → 自动统一到单一语种。
+> - **附加属性（`instructions`）同逻辑处理**：可写预设名 / 克隆名 / 行内标签，会追加合并并按同样规则去重。
+>
+> **克隆音色与文字属性可以同时使用**。
 >
 > - **怎么传**：`voice` 填克隆音色名，属性写在 `instructions` 字段
 >   （管理台：「声音」填克隆名 + 「附加属性」填属性串，并**勾选**「附加指令拼入属性串」）。
@@ -285,17 +305,20 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 >   （`male, low pitch`），或抬到 338 Hz（`female, high pitch`）。
 > - **只取白名单属性项**：非属性内容（如 DSHT 的情绪短语「温柔地」）会被**丢弃而非报错**，
 >   请求照常成功——情绪短语本来就不在 voice-design 白名单里。
-> - **中英混写会自动统一到单一语种**（有中文项则统一为中文），避免触发上游的混写校验。
 > - **显式关闭**：请求里带 `use_instructions: 0` 可禁用（端点支持该参数）；
 >   管理台取消勾选即禁用。
 >
-> ⚠️ 与**纯文字造声**模式的差异：design 模式下 `instructions` 仍受
-> `OMNI_TTS_USE_INSTRUCTIONS` 开关约束（默认关闭，**向后兼容不变**）；
-> 克隆模式下默认启用，因为克隆没有"基础属性串"可供"附加"，属性只能走 `instructions`。
+> ⚠️ `instructions` 字段是否被解析，受 `OMNI_TTS_USE_INSTRUCTIONS` 约束
+> （**默认开**）；请求里带 `use_instructions: 0` 可单独关闭，
+> 带 `1` 可单独开启。管理台则由「附加指令拼入属性串」勾选框控制。
 >
 > ⚠️ 属性是**相对参考音色的偏移**，不是绝对设定：参考音色已满足某属性时位移趋近于零
 > （给女声克隆加 `female, high pitch` 几乎不动）。**想改克隆的性别/音高，
 > 换参考音频比加属性更可靠。**
+>
+> ⚠️ **行内标签在克隆模式下效果被削弱**：`[whisper]` 在克隆下仍明显（RMS −48%），
+> 但 `[happy]` 在克隆下几乎无变化（RMS +0.2%），而纯文字造声下是 +14.6%——
+> 克隆音色本身已经占满了「表现力」。**要情绪请用纯文字造声，要音色请用克隆。**
 
 ### 3.8 OpenAI 端点请求参数全表（`POST /v1/audio/speech`）
 
@@ -305,8 +328,8 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 | 字段 | 类型 | 默认 | 范围 / 取值 | 建议 | 说明 |
 |---|---|---|---|---|---|
 | `input`（或 `text`） | str | — | 必填，≤4000 字 | — | 要合成的文本 |
-| `voice` | str | `alloy` | 预设名 / 属性串 / 克隆音色名 | 按需 | 见 §3.7 与 §4 |
-| `instructions` | str | 空 | OmniVoice 合法属性项 | 留空 | 需 `use_instructions` 或模型名含 gpt-4o 才拼入 |
+| `voice` | str | `alloy` | **可混用**：预设名 / 属性串 / 克隆音色名 / 行内标签 | 按需 | 见 §3.7 与 §4；无法识别的项被丢弃并在请求日志标记 |
+| `instructions` | str | 空 | 与 `voice` 同逻辑（属性项 / 预设名 / 克隆名 / 行内标签） | 留空 | 需 `use_instructions` 或模型名含 gpt-4o 才拼入 |
 | `response_format` | str | `mp3` | `mp3` `wav` `pcm` `flac` `opus` | `mp3` | 未知值返回 **400**（列出合法值），不静默回落 |
 | `speed` | num | `1.0` | 0.25–4 | 0.8–1.2 | 语速倍率 |
 | `num_step` | int | `32` | 1–100 | 16–48 | 扩散步数，越大越稳越慢，48+ 收益递减 |

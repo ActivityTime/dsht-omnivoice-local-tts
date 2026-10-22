@@ -34,6 +34,7 @@ import time
 import uuid
 import webbrowser
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -143,10 +144,15 @@ ASR_MODEL_ID = os.environ.get(
 ASR_DEVICE = os.environ.get("OMNIVOICE_ASR_DEVICE", "").strip() or None
 API_KEY = os.environ.get("OMNI_TTS_KEY", "")  # empty = accept any key
 VOICES_FILE = Path(os.environ.get("OMNI_TTS_VOICES", HERE / "voices.json"))
-# DSH-Tavern sends `instructions` (an emotion phrase) only when the model name
-# contains "gpt-4o". OmniVoice's design attributes have no emotion axis, so by
-# default the phrase is ignored; set this to 1 to append it to the instruct.
-USE_INSTRUCTIONS = os.environ.get("OMNI_TTS_USE_INSTRUCTIONS", "0") == "1"
+# Whether the `instructions` field is parsed as voice-design attributes.
+#
+# This used to default to off, because DSHT-Tavern sends `instructions` as an
+# emotion phrase ("温柔地") and OmniVoice's design attributes have no emotion
+# axis. The parser now keeps only whitelisted attribute items and drops
+# everything else, so an emotion phrase no longer needs to be ignored wholesale
+# -- it is dropped item by item instead. The switch is kept as a way to turn
+# the field off entirely, and now defaults to on.
+USE_INSTRUCTIONS = os.environ.get("OMNI_TTS_USE_INSTRUCTIONS", "1") == "1"
 
 # --- request history (admin console) ----------------------------------------
 # Each request made through the admin console is persisted as a directory
@@ -820,26 +826,15 @@ AUDIO_FORMATS = {
 AUDIO_FORMAT_NAMES = tuple(sorted(AUDIO_FORMATS))
 
 
-def pick_instruct(
-    voice: str,
-    instructions: str,
-    voices: dict[str, str],
-    use_instructions: bool | None = None,
-) -> str:
-    key = (voice or "").strip()
-    instruct = voices.get(key, voices.get(key.lower(), ""))
-    if not instruct:
-        # Not one of the known names: treat the value itself as a design string,
-        # so "female, elderly, 四川话" works straight from the voice field.
-        instruct = key
-    merge = USE_INSTRUCTIONS if use_instructions is None else use_instructions
-    if merge and instructions:
-        instruct = f"{instruct}, {instructions}" if instruct else instructions
-    return instruct.strip(" ,，")
+def _load_design_vocab() -> tuple[
+    frozenset[str], dict[str, str], dict[str, str], list[frozenset[str]]
+]:
+    """The upstream voice-design vocabulary.
 
-
-def _load_design_vocab() -> tuple[frozenset[str], dict[str, str], dict[str, str]]:
-    """The upstream voice-design vocabulary: valid items + EN/ZH mappings.
+    Returns the valid items, the EN/ZH mappings and the mutually exclusive
+    category groups (gender, age, pitch, style, accent, dialect) -- the
+    groups are needed to drop a conflicting item instead of letting the
+    upstream validator raise on it.
 
     Imported lazily because the library lives in the bundled interpreter; a
     missing import must not take the whole service down, so the caller gets
@@ -849,33 +844,108 @@ def _load_design_vocab() -> tuple[frozenset[str], dict[str, str], dict[str, str]
         from omnivoice.utils.voice_design import (  # noqa: PLC0415
             _INSTRUCT_ALL_VALID,
             _INSTRUCT_EN_TO_ZH,
+            _INSTRUCT_MUTUALLY_EXCLUSIVE,
             _INSTRUCT_ZH_TO_EN,
         )
     except Exception:  # noqa: BLE001
-        return frozenset(), {}, {}
-    return frozenset(_INSTRUCT_ALL_VALID), dict(_INSTRUCT_EN_TO_ZH), dict(_INSTRUCT_ZH_TO_EN)
+        return frozenset(), {}, {}, []
+    return (
+        frozenset(_INSTRUCT_ALL_VALID),
+        dict(_INSTRUCT_EN_TO_ZH),
+        dict(_INSTRUCT_ZH_TO_EN),
+        [frozenset(group) for group in _INSTRUCT_MUTUALLY_EXCLUSIVE],
+    )
 
 
-def _valid_design_items(text: str) -> list[str]:
-    """Pick the voice-design items out of a free-form string.
+def _dedupe_by_category(
+    items: list[str], categories: list[frozenset[str]]
+) -> tuple[list[str], list[str]]:
+    """Keep at most one item per mutually exclusive category.
 
-    The upstream validator (`_resolve_instruct`) raises on any item outside
-    the whitelist. That is right for a dedicated design request, but this
-    path receives whatever the caller happened to send -- notably DSHT's
-    `instructions`, which is an emotion phrase ("温柔地") rather than a
-    design attribute. Dropping unknown items keeps a clone request working
-    instead of failing the whole call over a phrase that was never meant as
-    an instruct in the first place.
+    The upstream validator raises when a category appears twice ("male" and
+    "female" together). Here the first item of a category wins and the
+    later ones are dropped, so mixing sources -- a preset plus a hand
+    written attribute, or the voice field plus the extra instructions --
+    cannot make a request fail. Returns `(kept, dropped)`.
     """
-    valid, _, _ = _load_design_vocab()
-    if not valid:
-        return []
-    items = []
-    for raw in re.split(r"\s*[,，]\s*", text or ""):
-        item = raw.strip().lower()
-        if item and item in valid and item not in items:
-            items.append(item)
-    return items
+    kept: list[str] = []
+    dropped: list[str] = []
+    taken: set[str] = set()
+    for item in items:
+        group = next((cat for cat in categories if item in cat), None)
+        if group is None:
+            # Not categorised (should not happen for a whitelisted item).
+            kept.append(item)
+            continue
+        marker = next(iter(sorted(group)))
+        if marker in taken:
+            # The category already has an item; the first one wins.
+            dropped.append(item)
+            continue
+        taken.add(marker)
+        kept.append(item)
+    return kept, dropped
+
+
+def _normalize_design_items(items: list[str]) -> tuple[str, list[str]]:
+    """Turn raw attribute items into one valid instruct string.
+
+    Three things have to happen, in this order:
+      1. an accent (English-only) and a dialect (Chinese-only) cannot be
+         combined -- the upstream validator raises on that pair, so the
+         accent is dropped;
+      2. at most one item per category may survive;
+      3. the rest is unified into a single language, because a mixed
+         Chinese/English instruct is rejected too.
+
+    Returns `(instruct, dropped)`.
+    """
+    valid, en_to_zh, zh_to_en, categories = _load_design_vocab()
+    dropped: list[str] = []
+
+    has_dialect = any(item.endswith("话") for item in items)
+    has_accent = any(" accent" in item for item in items)
+    if has_dialect and has_accent:
+        kept = []
+        for item in items:
+            if " accent" in item:
+                dropped.append(item)
+            else:
+                kept.append(item)
+        items = kept
+
+    items, conflicts = _dedupe_by_category(items, categories)
+    dropped.extend(conflicts)
+    if not items:
+        return "", dropped
+
+    has_zh = any(any("一" <= c <= "鿿" for c in item) for item in items)
+    if has_zh:
+        items = [en_to_zh.get(item, item) for item in items]
+    else:
+        items = [zh_to_en.get(item, item) for item in items]
+    return ("，" if has_zh else ", ").join(items), dropped
+
+
+def _merge_instructs(first: str, second: str) -> tuple[str, list[str]]:
+    """Merge two normalised attribute strings, one item per category.
+
+    Both sides are already normalised, so they may disagree on language
+    ("female" against "女") and may repeat a category (a preset's "female"
+    against an explicit "male"). Splitting both into items and
+    normalising once gives a string the upstream validator accepts.
+    Returns `(merged, dropped)`.
+    """
+    valid, _, _, _ = _load_design_vocab()
+    items: list[str] = []
+    for chunk in (first, second):
+        for raw in re.split(r"\s*[,，]\s*", chunk or ""):
+            item = raw.strip().lower()
+            if item and item in valid:
+                items.append(item)
+    if not items:
+        return "", []
+    return _normalize_design_items(items)
 
 
 def _voice_mode(clone: Any, instruct: str | None) -> str:
@@ -885,36 +955,158 @@ def _voice_mode(clone: Any, instruct: str | None) -> str:
     return "clone" if clone is not None else "design"
 
 
-def _instruct_for_clone(instructions: str) -> str:
-    """Build a voice-design instruct to apply on top of a cloned voice.
+# --- voice field parsing -----------------------------------------------------
+# The voice field is a free-form string and may mix several kinds of item:
+#
+#   "alloy"                     an official preset (voices.json) -> attributes
+#   "female, 四川话"             voice-design attributes
+#   "ja_Ganyu_0001"             a stored clone -> the clone is used, the item
+#                               itself is stripped from the attribute string
+#   "[happy]"                   an inline tag -> stripped from the attribute
+#                               string and prepended to the text
+#   "whatever"                  not recognised -> dropped, and reported
+#
+# Nothing here raises: an unusable item is dropped and recorded so the
+# request still produces audio. The report is attached to the archived
+# request so the console can show what happened to each item.
 
-    A clone already carries its own timbre, but the model accepts both
-    signals at once (the instruct block is written into the style tokens
-    unconditionally and the reference audio is appended separately), so a
-    design attribute can still shift the clone -- measured at up to -65% F0
-    for "male, low pitch" on a female clone.
+# The base checkpoint understands the 13 upstream non-verbal symbols.
+OFFICIAL_INLINE_TAGS = (
+    "laughter", "sigh", "confirmation-en", "question-en", "question-ah",
+    "question-oh", "question-ei", "question-yi", "surprise-ah",
+    "surprise-oh", "surprise-wa", "surprise-yo", "dissatisfaction-hnn",
+)
 
-    Only whitelisted design items survive. Everything else (DSHT emotion
-    phrases, free text) is dropped rather than raised, so a request never
-    fails because of a phrase that was not a design attribute.
+# The ModelsLab singing/emotion finetune adds eight more inline tags.
+EMOTION_INLINE_TAGS = (
+    "singing", "happy", "sad", "angry", "nervous", "whisper", "calm", "excited",
+)
 
-    The surviving items are then unified into a single language, because
-    the upstream validator rejects a mixed Chinese/English instruct. The
-    Chinese set wins when both are present, mirroring the upstream rule
-    that a dialect forces Chinese.
+# Which inline tags a given checkpoint understands. Keyed by a marker that
+# appears in the model's directory or id, so a renamed folder still matches.
+_MODEL_INLINE_TAGS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("omnivoice-singing", EMOTION_INLINE_TAGS),
+    ("omnivoice_singing", EMOTION_INLINE_TAGS),
+)
+
+
+def _active_model_entry() -> dict[str, Any]:
+    entry = _find_model(MODEL_CONFIG, MODEL_CONFIG.get("active") or "")
+    return entry or {}
+
+
+def _active_inline_tags() -> tuple[str, ...]:
+    """Inline tags the currently loaded checkpoint understands.
+
+    A tag the model does not know is not an error -- it is dropped and
+    reported, because a mistyped tag should not cost the user their audio.
     """
-    items = _valid_design_items(instructions)
-    if not items:
-        return ""
-    _, en_to_zh, zh_to_en = _load_design_vocab()
-    has_zh = any(any("一" <= c <= "鿿" for c in item) for item in items)
-    if has_zh:
-        items = [en_to_zh.get(item, item) for item in items]
-        separator = "，"
-    else:
-        items = [zh_to_en.get(item, item) for item in items]
-        separator = ", "
-    return separator.join(items)
+    entry = _active_model_entry()
+    haystack = f"{entry.get('id', '')} {entry.get('name', '')} {entry.get('path', '')}"
+    for marker, tags in _MODEL_INLINE_TAGS:
+        if marker.lower() in haystack.lower():
+            return OFFICIAL_INLINE_TAGS + tags
+    return OFFICIAL_INLINE_TAGS
+
+
+@dataclass
+class VoiceParts:
+    """A parsed voice field: what each kind of item resolved to."""
+
+    instruct: str = ""          # voice-design attribute string
+    # The clone prompt object. Typed loosely on purpose: `from __future__
+    # import annotations` turns annotations into strings, and a dataclass
+    # resolving a quoted annotation trips over it.
+    clone: object | None = None
+    clone_name: str = ""        # which clone was matched
+    inline_tags: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+    presets: list[str] = field(default_factory=list)
+
+    @property
+    def inline_prefix(self) -> str:
+        """The inline tags, formatted to be prepended to the text."""
+        return " ".join(f"[{tag}]" for tag in self.inline_tags)
+
+
+def _split_voice_items(text: str) -> list[str]:
+    """Split a voice field into items, keeping inline tags intact.
+
+    Inline tags arrive in their own bracket form and are not comma
+    separated, so the brackets are pulled out first and the remainder is
+    split on commas. The tags keep their brackets so the caller can tell
+    a tag from an attribute.
+    """
+    tags: list[str] = []
+    rest = re.sub(
+        r"\[([^\[\]]+)\]",
+        lambda m: tags.append(f"[{m.group(1).strip()}]") and " ",
+        text or "",
+    )
+    items = [part.strip() for part in re.split(r"\s*[,，]\s*", rest) if part.strip()]
+    return items + tags
+
+
+def parse_voice_field(
+    voice: str,
+    voices: dict[str, str],
+    clones: dict[str, Any],
+    inline_tags: tuple[str, ...],
+) -> VoiceParts:
+    """Resolve a free-form voice field into attributes, a clone and tags.
+
+    A stored clone wins over the attribute map for the same name; the
+    attributes are still collected and applied on top of the clone, since
+    the model takes both signals at once.
+    """
+    valid, _, _, _ = _load_design_vocab()
+    parts = VoiceParts()
+    design_items: list[str] = []
+
+    for item in _split_voice_items(voice):
+        low = item.lower()
+
+        if item.startswith("[") and item.endswith("]"):
+            tag = item[1:-1].strip().lower()
+            if tag in inline_tags:
+                if tag not in parts.inline_tags:
+                    parts.inline_tags.append(tag)
+            else:
+                parts.dropped.append(item)
+            continue
+
+        if item in clones:
+            if parts.clone is None:
+                parts.clone = clones[item]
+                parts.clone_name = item
+            else:
+                parts.dropped.append(item)
+            continue
+
+        preset = voices.get(item) or voices.get(low)
+        if preset:
+            parts.presets.append(item)
+            for sub in _split_voice_items(preset):
+                sub_low = sub.strip().lower()
+                if sub_low in valid and sub_low not in design_items:
+                    design_items.append(sub_low)
+            continue
+
+        if low in valid:
+            if low not in design_items:
+                design_items.append(low)
+            continue
+
+        parts.dropped.append(item)
+
+    # Unify the attribute items into a single language, the way the upstream
+    # validator would: a Chinese item forces Chinese, otherwise English.
+    if design_items:
+        # One item per category, a single language, no accent/dialect clash.
+        parts.instruct, conflicts = _normalize_design_items(design_items)
+        parts.dropped.extend(conflicts)
+
+    return parts
 
 
 def _clone_path(name: str) -> Path:
@@ -950,21 +1142,55 @@ def resolve_voice(
     instructions: str,
     voices: dict[str, str],
     use_instructions: bool | None = None,
-) -> tuple[str | None, Any]:
-    """Return `(instruct, clone)` for a voice field.
+) -> tuple[str | None, Any, VoiceParts]:
+    """Resolve the voice field and the extra instructions.
 
-    A stored clone wins over the attribute map. The two are no longer
-    mutually exclusive: a clone may also carry a voice-design instruct,
-    which the model applies on top of the cloned timbre (the instruct
-    block and the reference audio reach it as separate signals, so both
-    are honoured at once). Only whitelisted design items are used --
-    free-form text such as an emotion phrase is dropped, not raised.
+    Returns `(instruct, clone, parts)`. `parts` carries the full report of
+    what each item in the voice field resolved to -- the clone that was
+    matched, the inline tags that were recognised, and the items that were
+    dropped -- so the request can be archived with that detail.
+
+    The voice field may mix presets, design attributes, clone names and
+    inline tags. The extra instructions are appended to the attribute
+    string and parsed the same way.
+
+    A clone and a design attribute are not exclusive: the model takes the
+    reference audio and the attributes as separate signals, so both apply.
     """
-    key = (voice or "").strip()
-    if key in clone_names():
-        instruct = "" if use_instructions is False else _instruct_for_clone(instructions)
-        return (instruct or None), get_clone(key)
-    return pick_instruct(key, instructions, voices, use_instructions), None
+    clones = {name: get_clone(name) for name in clone_names()}
+    clones = {name: prompt for name, prompt in clones.items() if prompt is not None}
+    inline_tags = _active_inline_tags()
+
+    parts = parse_voice_field(voice or "", voices, clones, inline_tags)
+
+    # `use_instructions` is tri-state: True forces the field on, False forces
+    # it off, None follows the global OMNI_TTS_USE_INSTRUCTIONS switch.
+    use_extra = USE_INSTRUCTIONS if use_instructions is None else bool(use_instructions)
+    extra = (instructions or "") if use_extra else ""
+    if extra:
+        extra_parts = parse_voice_field(extra, voices, clones, inline_tags)
+        # A clone named in the extra instructions cannot replace the one
+        # from the voice field: the model takes a single clone.
+        if extra_parts.clone is not None and parts.clone is None:
+            parts.clone = extra_parts.clone
+            parts.clone_name = extra_parts.clone_name
+        elif extra_parts.clone is not None:
+            extra_parts.dropped.append(extra_parts.clone_name)
+        for tag in extra_parts.inline_tags:
+            if tag not in parts.inline_tags:
+                parts.inline_tags.append(tag)
+        parts.dropped.extend(extra_parts.dropped)
+        parts.presets.extend(extra_parts.presets)
+        if extra_parts.instruct:
+            # The two attribute strings were normalised separately, so they
+            # can disagree on language and repeat a category (a preset's
+            # "female" against an explicit "male"). Merge the items and
+            # normalise once, so one item per category survives.
+            merged, dropped = _merge_instructs(parts.instruct, extra_parts.instruct)
+            parts.instruct = merged
+            parts.dropped.extend(dropped)
+
+    return (parts.instruct or None), parts.clone, parts
 
 
 def run_generate(
@@ -1297,6 +1523,7 @@ def save_api_record(
     cache: str,
     client: str,
     error: str | None = None,
+    voice_report: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Archive one /v1/audio/speech request under records/ (failures included).
 
@@ -1321,6 +1548,7 @@ def save_api_record(
                 "elapsed_ms": elapsed_ms,
                 "cache": cache,
                 "client": client,
+                **(voice_report or {}),
                 **({"error": error} if error else {}),
             },
             payload,
@@ -1429,17 +1657,32 @@ async def speech(request: Request, authorization: str | None = Header(default=No
     num_step = gen.pop("num_step")
 
     voices_map = load_voices()
-    # `use_instructions` is tri-state here: absent -> the clone+design
-    # combination is allowed by default (a clone has no base attribute
-    # string for extra attributes to be "appended" to, and only whitelisted
-    # design items survive anyway), 0 -> explicitly off, 1 -> on.
+    # `use_instructions` is tri-state here: absent -> follow the global
+    # OMNI_TTS_USE_INSTRUCTIONS switch (on by default), 0 -> explicitly
+    # off, 1 -> explicitly on.
     use_instr = body.get("use_instructions")
     if use_instr is None:
         use_instr_arg: bool | None = None
     else:
         use_instr_arg = bool(use_instr)
-    instruct, clone = resolve_voice(voice, instructions, voices_map, use_instr_arg)
+    instruct, clone, voice_parts = resolve_voice(
+        voice, instructions, voices_map, use_instr_arg
+    )
+    # Inline tags travel in the text, so they are prepended to it. The
+    # cache key uses the resulting text, so a tagged request never hits
+    # an untagged entry.
+    if voice_parts.inline_prefix:
+        text = f"{voice_parts.inline_prefix} {text}"
     voice_mode = _voice_mode(clone, instruct)
+    # What each item in the voice field resolved to. Kept in the archive so
+    # the console can show dropped items, the matched clone and the inline
+    # tags instead of leaving the user guessing.
+    voice_report = {
+        "dropped": voice_parts.dropped,
+        "matched_clone": voice_parts.clone_name,
+        "inline_tags": voice_parts.inline_tags,
+        "presets": voice_parts.presets,
+    }
     client = request.client.host if request.client else ""
     started = time.perf_counter()
 
@@ -1469,12 +1712,14 @@ async def speech(request: Request, authorization: str | None = Header(default=No
                 text=text, voice=voice, voice_mode=voice_mode, instruct=instruct,
                 speed=speed, num_step=num_step, fmt=fmt, gen_overrides=gen_overrides,
                 elapsed_ms=elapsed_ms, payload=payload, cache="hit", client=client,
+                voice_report=voice_report,
             )
             api_log_append({
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "status": "ok", "cache": "hit", "text": text, "voice": voice,
                 "voice_mode": voice_mode, "format": fmt, "elapsed_ms": elapsed_ms,
                 "bytes": len(payload), "client": client, "id": (record or {}).get("id"),
+                **voice_report,
             })
             return Response(content=payload, media_type=media_type, headers={"X-Cache": "hit"})
 
@@ -1495,12 +1740,12 @@ async def speech(request: Request, authorization: str | None = Header(default=No
             text=text, voice=voice, voice_mode=voice_mode, instruct=instruct,
             speed=speed, num_step=num_step, fmt=fmt, gen_overrides=gen_overrides,
             elapsed_ms=elapsed_ms, payload=None, cache="miss", client=client,
-            error=str(error),
+            error=str(error), voice_report=voice_report,
         )
         api_log_append({
             "time": datetime.now().isoformat(timespec="seconds"),
             "status": "error", "cache": "miss" if key else "off", "text": text,
-            "voice": voice, "voice_mode": voice_mode, "format": fmt,
+            "voice": voice, "voice_mode": voice_mode, "format": fmt, **voice_report,
             "elapsed_ms": elapsed_ms, "bytes": 0, "client": client,
             "error": str(error), "id": (record or {}).get("id"),
         })
@@ -1518,12 +1763,12 @@ async def speech(request: Request, authorization: str | None = Header(default=No
         text=text, voice=voice, voice_mode=voice_mode, instruct=instruct,
         speed=speed, num_step=num_step, fmt=fmt, gen_overrides=gen_overrides,
         elapsed_ms=elapsed_ms, payload=payload, cache="miss" if key else "off",
-        client=client,
+        client=client, voice_report=voice_report,
     )
     api_log_append({
         "time": datetime.now().isoformat(timespec="seconds"),
         "status": "ok", "cache": "miss" if key else "off", "text": text,
-        "voice": voice, "voice_mode": voice_mode, "format": fmt,
+        "voice": voice, "voice_mode": voice_mode, "format": fmt, **voice_report,
         "elapsed_ms": elapsed_ms, "bytes": len(payload), "client": client,
         "id": (record or {}).get("id"),
     })
@@ -2525,7 +2770,11 @@ async def admin_generate(request: Request):
     speed = gen.pop("speed")
     num_step = gen.pop("num_step")
 
-    instruct, clone = resolve_voice(voice, instructions, load_voices(), use_instr)
+    instruct, clone, voice_parts = resolve_voice(
+        voice, instructions, load_voices(), use_instr
+    )
+    if voice_parts.inline_prefix:
+        text = f"{voice_parts.inline_prefix} {text}"
     fields: dict[str, Any] = {
         "source": "admin",
         "text": text,
@@ -2538,6 +2787,11 @@ async def admin_generate(request: Request):
         "num_step": num_step,
         "format": fmt,
         "gen_params": gen_overrides,
+        # What each item in the voice field resolved to.
+        "dropped": voice_parts.dropped,
+        "matched_clone": voice_parts.clone_name,
+        "inline_tags": voice_parts.inline_tags,
+        "presets": voice_parts.presets,
     }
 
     started = time.perf_counter()
