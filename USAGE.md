@@ -1,6 +1,6 @@
 # OmniVoice 本地 TTS 服务 · 使用与部署说明
 
-> 本文档为「整理版使用说明」，配套部署目录 `K:\OmniVoice\`。
+> 本文档为「整理版使用说明」，配套部署目录即本文所在的项目根目录（`<项目根>`）。
 > 研究过程与排障细节见同仓库的 `OmniVoice部署调研.md`。
 
 ---
@@ -67,7 +67,7 @@ OmniVoice（k2-fsa / 小米 Next-gen Kaldi 开源 TTS，~0.6B 参数，扩散语
 
 ### 3.2 后台启动（无窗口、日志落盘）
 ```bat
-cd /d "K:\OmniVoice"
+cd /d "<项目根>"
 python\python.exe server.py > server.log 2>&1
 ```
 > 关掉窗口它就停。要长期开机自启，见 `OmniVoice部署调研.md` 第八节（NSSM / 启动项）。
@@ -121,7 +121,7 @@ python\python.exe server.py > server.log 2>&1
 | `OMNI_TTS_ADMIN_PAGE` | `admin.html` | 管理台页面文件位置 |
 | `OMNI_TTS_TRAY` | `1` | 是否显示系统托盘图标（仅 Windows 有效）；`0` 关闭 |
 | `OMNI_MODEL_CONFIG` | `model_config.json` | 模型注册表文件位置（运行时状态，不入库） |
-| `OMNI_TTS_MODEL_DIRS` | 空 | 追加的模型扫描目录（`os.pathsep` 分隔，如 `D:\models;E:\weights`） |
+| `OMNI_TTS_MODEL_DIRS` | 空 | 追加的模型扫描目录（`os.pathsep` 分隔，如 `<目录1>;<目录2>`） |
 
 ### 3.4 健康检查
 ```bat
@@ -151,7 +151,9 @@ curl http://127.0.0.1:8890/health
 4. **回看与复用** —— 列表内直接试听、下载、把历史参数一键回填表单重跑、单条删除或清空全部；顶部显示
    总条数/成功/失败/累计产出体积。
 5. **API 记录子页面** —— 控制台底部「API 记录」区块分三块：①「请求日志」表（时间 / 状态 / 缓存命中 / 音色 / 模式 / 格式 / 耗时 / 字节 / 文本，环形缓冲最近 300 条）；②「音频记录与轮转」列表（与 history 同款可试听 / 下载 / 删除，并显示当前用量 vs 三阈值）；③ 顶部统计当前缓存命中 / 未命中 / 写入数与磁盘占用。DSHT 每次调用都会在此留档（默认开启，关闭见 `OMNI_API_RECORD` / `OMNI_TTS_LOG_API`）。
-6. **响应缓存** —— 相同参数（`text` + `voice` + `instruct` + `format` + 全部生成参数；克隆音色还含其 `.pt` 文件签名）的请求直接返回已生成音频，响应头 `X-Cache: hit`，跳过模型推理（实测加速数百倍）。缓存落 `cache/` 并按三阈值轮转；**命中条目仍会写入 API 记录**以保持审计完整。
+6. **响应缓存** —— 相同参数（`text` + `voice` + `instruct` + `format` + 全部生成参数；克隆音色还含其 `.pt` 文件签名；**当前模型 id**）的请求直接返回已生成音频，响应头 `X-Cache: hit`，跳过模型推理（实测加速数百倍）。缓存落 `cache/` 并按三阈值轮转；**命中条目仍会写入 API 记录**以保持审计完整。
+   > 缓存 key **包含当前模型 id**：切换模型（§3.9）后同一句文本会重新生成，不会返回上一个模型的音频；
+   > 切回原模型则又能命中它自己的缓存。
 7. **模型管理面板** —— 顶部导航「模型管理」：显示当前生效模型（名称/类型/路径/设备/dtype/ASR）、
    已注册模型下拉选择、「加载并设为当前」「扫描目录」「删除所选」，
    以及手工注册新模型（id / 名称 / 路径 / 类型 checkpoint|lora）。切换即时生效并写入
@@ -432,7 +434,7 @@ DSHT 后端把你在界面填的「接口地址」**原样转发**到该 URL（�
 
 1. **venv 绑死本机 Python（致命）**
    `venv/pyvenv.cfg` 的 `home` 指向 WorkBuddy 托管的 Python：
-   `K:\Users\ACTIM.DESKTOP-BPAEDTM\.workbuddy\binaries\python\versions\3.13.12`。
+   `<用户目录>/.workbuddy/binaries/python/versions/<版本号>`。
    当前机器能跑是因为该路径存在；**迁移到别的机器，该路径不存在 → venv 直接失效**。
    且 `venv/Lib/` 仅含 `site-packages`，真正的 Python 运行时（python313.dll + stdlib）来自上述 home，
    venv 自身不携带。

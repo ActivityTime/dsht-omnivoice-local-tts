@@ -1083,12 +1083,18 @@ def _cache_key(
     num_step: int,
     gen: dict[str, Any],
     clone_identity: str | None = None,
+    model_id: str | None = None,
 ) -> str:
     """Hash of everything that can change the output bytes.
 
     `gen` must be the fully resolved set (defaults applied), so an omitted knob
     and an explicitly-defaulted one hash identically. Clones contribute their
     file signature; design voices contribute the resolved instruct string.
+
+    `model_id` must be part of the hash: the active model can be swapped at
+    runtime (see /admin/models/load), and the same request against a different
+    checkpoint yields different audio. Without it a cache hit would replay the
+    previous model's voice/emotion — audible and wrong.
     """
     payload = {
         "text": text,
@@ -1099,6 +1105,7 @@ def _cache_key(
         "speed": speed,
         "num_step": num_step,
         "gen": {key: gen.get(key) for key in sorted(gen)},
+        "model": model_id or "",
     }
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -1352,6 +1359,7 @@ async def speech(request: Request, authorization: str | None = Header(default=No
             num_step=num_step,
             gen=gen,
             clone_identity=_clone_identity(voice) if clone is not None else None,
+            model_id=_state.get("model_id") or MODEL_CONFIG.get("active") or "",
         )
         cached = cache_get(key)
         if cached is not None:
