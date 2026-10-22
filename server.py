@@ -89,8 +89,10 @@ if str(HERE) not in sys.path:
 # always override a stored value for a single run.
 try:
     import settings as _settings  # noqa: E402
+    import emotion_map as _emotion_map  # noqa: E402
 
     _INJECTED = _settings.apply_configured_env()
+    _EMOTION_TABLE = _emotion_map.ensure_map()
     if _INJECTED:
         # logging is not configured yet this early, so this line goes to
         # stderr only; the same list is repeated in the startup log below.
@@ -101,7 +103,9 @@ try:
         )
 except Exception as _error:  # noqa: BLE001
     _settings = None
+    _emotion_map = None
     _INJECTED = {}
+    _EMOTION_TABLE = {}
     print(f"[omnivoice] settings registry unavailable: {_error}", flush=True)
 
 # Hugging Face cache lives next to this file unless the caller overrides it.
@@ -1049,6 +1053,9 @@ class VoiceParts:
     inline_tags: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
     presets: list[str] = field(default_factory=list)
+    # Emotion phrases that the adapter turned into a tag, as
+    # "phrase -> target" pairs.
+    emotion_mapped: list[dict[str, str]] = field(default_factory=list)
 
     @property
     def inline_prefix(self) -> str:
@@ -1079,18 +1086,37 @@ def parse_voice_field(
     voices: dict[str, str],
     clones: dict[str, Any],
     inline_tags: tuple[str, ...],
+    emotion_table: dict[str, list[str]] | None = None,
 ) -> VoiceParts:
     """Resolve a free-form voice field into attributes, a clone and tags.
 
     A stored clone wins over the attribute map for the same name; the
     attributes are still collected and applied on top of the clone, since
     the model takes both signals at once.
+
+    Emotion phrases (the adapter for DSH-Tavern's `instructions`) are
+    pulled out first, before the remainder is read as attributes: a phrase
+    like "用温柔的语气说话" is not an attribute, and reading it as one would
+    have it rejected.
     """
     valid, _, _, _ = _load_design_vocab()
     parts = VoiceParts()
     design_items: list[str] = []
 
-    for item in _split_voice_items(voice):
+    residual = voice or ""
+    if emotion_table:
+        residual, mapped_inline, mapped_design, unmatched, mapped = _emotion_map.extract(
+            residual, emotion_table, inline_tags, valid
+        )
+        for tag in mapped_inline:
+            if tag not in parts.inline_tags:
+                parts.inline_tags.append(tag)
+        design_items.extend(mapped_design)
+        parts.dropped.extend(unmatched)
+        parts.emotion_mapped.extend(mapped)
+
+    unknown: list[str] = []
+    for item in _split_voice_items(residual):
         low = item.lower()
 
         if item.startswith("[") and item.endswith("]"):
@@ -1099,7 +1125,7 @@ def parse_voice_field(
                 if tag not in parts.inline_tags:
                     parts.inline_tags.append(tag)
             else:
-                parts.dropped.append(item)
+                unknown.append(item)
             continue
 
         if item in clones:
@@ -1107,7 +1133,7 @@ def parse_voice_field(
                 parts.clone = clones[item]
                 parts.clone_name = item
             else:
-                parts.dropped.append(item)
+                unknown.append(item)
             continue
 
         preset = voices.get(item) or voices.get(low)
@@ -1124,7 +1150,15 @@ def parse_voice_field(
                 design_items.append(low)
             continue
 
-        parts.dropped.append(item)
+        unknown.append(item)
+
+    # If nothing at all was understood, report the remainder as one item.
+    # Splitting a sentence like "用温柔的语气说话" into "用" "的" "语气"
+    # "说话" would fill the log with fragments that say nothing useful.
+    if unknown and not design_items and not parts.inline_tags and parts.clone is None:
+        parts.dropped.append(residual.strip() or unknown[0])
+    else:
+        parts.dropped.extend(unknown)
 
     # Unify the attribute items into a single language, the way the upstream
     # validator would: a Chinese item forces Chinese, otherwise English.
@@ -1187,15 +1221,16 @@ def resolve_voice(
     clones = {name: get_clone(name) for name in clone_names()}
     clones = {name: prompt for name, prompt in clones.items() if prompt is not None}
     inline_tags = _active_inline_tags()
+    table = _EMOTION_TABLE if _emotion_map is not None else {}
 
-    parts = parse_voice_field(voice or "", voices, clones, inline_tags)
+    parts = parse_voice_field(voice or "", voices, clones, inline_tags, table)
 
     # `use_instructions` is tri-state: True forces the field on, False forces
     # it off, None follows the global OMNI_TTS_USE_INSTRUCTIONS switch.
     use_extra = USE_INSTRUCTIONS if use_instructions is None else bool(use_instructions)
     extra = (instructions or "") if use_extra else ""
     if extra:
-        extra_parts = parse_voice_field(extra, voices, clones, inline_tags)
+        extra_parts = parse_voice_field(extra, voices, clones, inline_tags, table)
         # A clone named in the extra instructions cannot replace the one
         # from the voice field: the model takes a single clone.
         if extra_parts.clone is not None and parts.clone is None:
@@ -1208,6 +1243,7 @@ def resolve_voice(
                 parts.inline_tags.append(tag)
         parts.dropped.extend(extra_parts.dropped)
         parts.presets.extend(extra_parts.presets)
+        parts.emotion_mapped.extend(extra_parts.emotion_mapped)
         if extra_parts.instruct:
             # The two attribute strings were normalised separately, so they
             # can disagree on language and repeat a category (a preset's
@@ -1709,6 +1745,9 @@ async def speech(request: Request, authorization: str | None = Header(default=No
         "matched_clone": voice_parts.clone_name,
         "inline_tags": voice_parts.inline_tags,
         "presets": voice_parts.presets,
+        # What the caller actually sent, so the archive can be read back.
+        "instructions": instructions,
+        "emotion_mapped": voice_parts.emotion_mapped,
     }
     client = request.client.host if request.client else ""
     started = time.perf_counter()
@@ -2322,6 +2361,116 @@ async def admin_settings_reset(request: Request) -> dict[str, Any]:
         "cleared": cleared,
         "restored_live": restored,
         "settings": _settings.describe(),
+    }
+
+
+# --- emotion map (adapter for DSH-Tavern's emotion phrases) ---------------
+
+@app.get("/admin/emotion-map", include_in_schema=False)
+def admin_emotion_map() -> dict[str, Any]:
+    """The mapping table, plus which targets the loaded checkpoint can use."""
+    if _emotion_map is None:
+        raise HTTPException(status_code=503, detail="emotion map unavailable")
+    valid, _, _, _ = _load_design_vocab()
+    inline_tags = _active_inline_tags()
+    table = _emotion_map.load_map()
+    return {
+        "ok": True,
+        "map_file": str(_emotion_map.map_path()),
+        "active_model": _state.get("model_id") or MODEL_CONFIG.get("active"),
+        "inline_tags": list(inline_tags),
+        "targets": _emotion_map.known_targets(inline_tags, valid),
+        "mappings": _emotion_map.describe(table, inline_tags, valid),
+        "count": len(table),
+    }
+
+
+@app.post("/admin/emotion-map", include_in_schema=False)
+async def admin_emotion_map_save(request: Request) -> dict[str, Any]:
+    """Store the mapping table.
+
+    Accepts either a full table or a single entry, so the console can add
+    one row without resending everything.
+    """
+    if _emotion_map is None:
+        raise HTTPException(status_code=503, detail="emotion map unavailable")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    table = _emotion_map.load_map()
+    added: list[str] = []
+    removed: list[str] = []
+    errors: list[str] = []
+
+    raw = body.get("mappings")
+    if isinstance(raw, dict):
+        # A full replacement: every phrase in the payload is the table.
+        table = {}
+        for key, value in raw.items():
+            phrase = str(key).strip()
+            targets = _emotion_map._normalise(value)
+            if not phrase:
+                continue
+            if not targets:
+                errors.append(f"「{phrase}」没有指定目标标签")
+                continue
+            table[phrase] = targets
+            added.append(phrase)
+    else:
+        phrase = str(body.get("phrase") or "").strip()
+        targets = _emotion_map._normalise(body.get("targets"))
+        remove = bool(body.get("remove"))
+        if not phrase:
+            raise HTTPException(status_code=400, detail="缺少 phrase")
+        if remove:
+            if table.pop(phrase, None) is not None:
+                removed.append(phrase)
+        else:
+            if not targets:
+                raise HTTPException(status_code=400, detail="缺少 targets")
+            table[phrase] = targets
+            added.append(phrase)
+
+    if errors:
+        raise HTTPException(status_code=400, detail="；".join(errors))
+
+    _emotion_map.save_map(table)
+    # Update in place: a plain assignment here would create a local name
+    # and leave the module-level table -- the one the parser reads -- stale.
+    _EMOTION_TABLE.clear()
+    _EMOTION_TABLE.update(table)
+    valid, _, _, _ = _load_design_vocab()
+    inline_tags = _active_inline_tags()
+    return {
+        "ok": True,
+        "added": added,
+        "removed": removed,
+        "mappings": _emotion_map.describe(table, inline_tags, valid),
+        "count": len(table),
+    }
+
+
+@app.post("/admin/emotion-map/reset", include_in_schema=False)
+def admin_emotion_map_reset() -> dict[str, Any]:
+    """Restore the built-in default table."""
+    if _emotion_map is None:
+        raise HTTPException(status_code=503, detail="emotion map unavailable")
+    table = {key: list(value) for key, value in _emotion_map.DEFAULT_MAPPING.items()}
+    _emotion_map.save_map(table)
+    # Update in place: a plain assignment here would create a local name
+    # and leave the module-level table -- the one the parser reads -- stale.
+    _EMOTION_TABLE.clear()
+    _EMOTION_TABLE.update(table)
+    valid, _, _, _ = _load_design_vocab()
+    inline_tags = _active_inline_tags()
+    return {
+        "ok": True,
+        "mappings": _emotion_map.describe(table, inline_tags, valid),
+        "count": len(table),
     }
 
 

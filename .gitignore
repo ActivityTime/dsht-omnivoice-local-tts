@@ -45,6 +45,10 @@ ehthumbs.db
 /runtime_config.json
 /runtime_config.json.tmp
 
+# ===== 情绪标签映射表（DSHT 适配层，可在控制台编辑，本机状态）=====
+/emotion_map.json
+/emotion_map.json.tmp
+
 # ===== 外部权重挂载点（Windows 目录联接，不是真实内容，不入库）=====
 /finetunes/
 

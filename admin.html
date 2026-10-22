@@ -444,6 +444,32 @@
     </div>
     <div id="cfgGroups"></div>
     <div id="cfgStatus"></div>
+
+    <h3 class="sub">情绪标签映射 <span class="meta">（DSHT 适配层）</span></h3>
+    <div class="hint" style="margin:0 0 10px">
+      DSHT 发在 <code>instructions</code> 里的情绪短语（如「温柔地」）不在 OmniVoice 的属性白名单里，
+      原本会被丢弃。这里把短语映射到模型真正认得的标签：映射到<b>行内标签</b>的会加到文本开头，
+      映射到<b>属性</b>的会进属性串；当前模型不支持的目标会被丢弃并在请求日志里标出。
+      短语按<b>最长优先</b>做子串匹配（「用温柔的语气说话」会命中「温柔」）。
+    </div>
+    <div class="toolbar">
+      <button id="emReload">重新载入</button>
+      <button id="emSave" class="primary">保存映射</button>
+      <button id="emReset" class="danger">恢复内置默认</button>
+      <span class="spacer"></span>
+      <span class="stats" id="emStats"></span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="emPhrase" type="text" placeholder="DSHT 情绪短语，如 温柔地" style="flex:1;min-width:180px">
+      <input id="emTargets" type="text" placeholder="目标标签，逗号分隔，如 whisper, happy" style="flex:1;min-width:200px">
+      <button id="emAdd">添加 / 覆盖</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <input id="emFilter" type="text" placeholder="筛选短语或目标标签…" style="flex:1;min-width:220px">
+      <label class="check"><input id="emOnlyUnusable" type="checkbox"> 只看当前模型用不了的</label>
+    </div>
+    <div id="emStatus"></div>
+    <div id="emList" style="margin-top:12px"><div class="empty">加载中…</div></div>
   </section>
 
   <section class="card" id="apirec">
@@ -1438,7 +1464,175 @@ $("cfgReset").onclick = async () => {
   await loadSettings();
 };
 
+/* ---------- emotion map (DSHT adapter) ---------- */
+let EM_ROWS = [];
+let EM_TARGETS = [];
+const EM_EDITED = new Map();
+const EM_REMOVED = new Set();
+
+function emTargetLabel(t) {
+  if (t.kind === "inline") return "行内标签";
+  if (t.kind === "design") return "属性";
+  return "未知";
+}
+
+function renderEmotionMap(data) {
+  EM_ROWS = data.mappings || [];
+  EM_TARGETS = data.targets || [];
+  const avail = (data.inline_tags || []).length;
+  $("emStats").textContent =
+    `${EM_ROWS.length} 条映射 · 当前模型支持 ${avail} 个行内标签`;
+
+  const needle = ($("emFilter").value || "").trim().toLowerCase();
+  const onlyUnusable = $("emOnlyUnusable").checked;
+  const shown = EM_ROWS.filter((m) => {
+    if (onlyUnusable && m.available) return false;
+    if (!needle) return true;
+    if (m.phrase.toLowerCase().includes(needle)) return true;
+    return m.targets.some((t) => t.name.toLowerCase().includes(needle));
+  });
+
+  const rows = shown.map((m) => {
+    const edited = EM_EDITED.get(m.phrase);
+    const removed = EM_REMOVED.has(m.phrase);
+    let targetsHtml;
+    if (edited !== undefined) {
+      targetsHtml = `<input type="text" data-em-target="${esc(m.phrase)}" value="${esc(edited.join(", "))}" style="flex:1;min-width:200px">`;
+    } else {
+      const chips = m.targets.map((t) => {
+        const cls = t.available ? "tag on" : "tag warn";
+        const note = t.available ? emTargetLabel(t) : "当前模型不可用";
+        return `<span class="${cls}">${esc(t.name)} · ${esc(note)}</span>`;
+      }).join(" ");
+      targetsHtml = `<div class="chips" style="margin:0">${chips || "<span class='meta'>（无目标）</span>"}</div>`;
+    }
+    return `<div class="rec" style="margin-bottom:6px;${removed ? "opacity:.45" : ""}">
+      <div class="row">
+        <code style="min-width:130px">${esc(m.phrase)}</code>
+        <span class="spacer"></span>
+        ${removed ? '<span class="tag warn">将删除</span>' : ""}
+        <button data-em-del="${esc(m.phrase)}" class="danger">删除</button>
+      </div>
+      <div class="row" style="margin-top:5px">
+        <span class="meta" style="min-width:130px">目标</span>
+        ${targetsHtml}
+      </div>
+    </div>`;
+  }).join("");
+  const hidden = EM_ROWS.length - shown.length;
+  $("emList").innerHTML = rows
+    ? rows + (hidden ? `<div class="meta">另有 ${hidden} 条被筛选隐藏</div>` : "")
+    : '<div class="empty">没有匹配的映射条目</div>';
+}
+
+async function loadEmotionMap() {
+  try {
+    const r = await api("/admin/emotion-map");
+    const data = await r.json();
+    if (!r.ok) {
+      $("emList").innerHTML = `<div class="empty">${esc(data.detail || "读取失败")}</div>`;
+      return;
+    }
+    renderEmotionMap(data);
+  } catch (e) {
+    $("emList").innerHTML = `<div class="empty">读取失败：${esc(String(e))}</div>`;
+  }
+}
+
+$("emList").addEventListener("change", (ev) => {
+  const el = ev.target.closest("[data-em-target]");
+  if (!el) return;
+  const phrase = el.dataset.emTarget;
+  const targets = el.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+  EM_EDITED.set(phrase, targets);
+  EM_REMOVED.delete(phrase);
+});
+
+$("emList").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-em-del]");
+  if (!btn) return;
+  const phrase = btn.dataset.emDel;
+  if (!confirm(`删除映射「${phrase}」？`)) return;
+  EM_REMOVED.add(phrase);
+  EM_EDITED.delete(phrase);
+  renderEmotionMap({ mappings: EM_ROWS, targets: EM_TARGETS, inline_tags: [] });
+});
+
+$("emAdd").onclick = async () => {
+  const phrase = $("emPhrase").value.trim();
+  const targets = $("emTargets").value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+  if (!phrase || !targets.length) {
+    $("emStatus").innerHTML = '<div class="hint">短语与目标标签都要填。</div>';
+    return;
+  }
+  const r = await api("/admin/emotion-map", {
+    method: "POST",
+    body: JSON.stringify({ phrase: phrase, targets: targets }),
+  });
+  const d = await r.json();
+  if (!r.ok) {
+    $("emStatus").innerHTML = `<div class="text" style="color:var(--err)">保存失败：${esc(d.detail || r.status)}</div>`;
+    return;
+  }
+  $("emPhrase").value = "";
+  $("emTargets").value = "";
+  $("emStatus").innerHTML = `<div class="hint">已保存「${esc(phrase)}」→ ${esc(targets.join(", "))}，下次请求即生效。</div>`;
+  await loadEmotionMap();
+};
+
+$("emSave").onclick = async () => {
+  const payload = {};
+  // Start from the current table, apply the edits, drop the deletions.
+  EM_ROWS.forEach((m) => {
+    if (EM_REMOVED.has(m.phrase)) return;
+    const edited = EM_EDITED.get(m.phrase);
+    payload[m.phrase] = edited !== undefined ? edited : m.targets.map((t) => t.name);
+  });
+  EM_EDITED.forEach((targets, phrase) => { payload[phrase] = targets; });
+  if (!Object.keys(payload).length) {
+    $("emStatus").innerHTML = '<div class="hint">映射表是空的，没有可保存的内容。</div>';
+    return;
+  }
+  const r = await api("/admin/emotion-map", {
+    method: "POST",
+    body: JSON.stringify({ mappings: payload }),
+  });
+  const d = await r.json();
+  if (!r.ok) {
+    $("emStatus").innerHTML = `<div class="text" style="color:var(--err)">保存失败：${esc(d.detail || r.status)}</div>`;
+    return;
+  }
+  EM_EDITED.clear();
+  EM_REMOVED.clear();
+  $("emStatus").innerHTML = `<div class="hint">已保存 ${Object.keys(payload).length} 条映射，下次请求即生效。</div>`;
+  await loadEmotionMap();
+};
+
+$("emReset").onclick = async () => {
+  if (!confirm("恢复内置默认映射表？当前自定义条目会被覆盖。")) return;
+  const r = await api("/admin/emotion-map/reset", { method: "POST" });
+  const d = await r.json();
+  if (!r.ok) {
+    $("emStatus").innerHTML = `<div class="text" style="color:var(--err)">恢复失败：${esc(d.detail || r.status)}</div>`;
+    return;
+  }
+  EM_EDITED.clear();
+  EM_REMOVED.clear();
+  $("emStatus").innerHTML = '<div class="hint">已恢复内置默认映射表。</div>';
+  await loadEmotionMap();
+};
+
+$("emReload").onclick = () => { EM_EDITED.clear(); EM_REMOVED.clear(); loadEmotionMap(); };
+
+$("emFilter").addEventListener("input", () => {
+  renderEmotionMap({ mappings: EM_ROWS, targets: EM_TARGETS, inline_tags: [] });
+});
+$("emOnlyUnusable").addEventListener("change", () => {
+  renderEmotionMap({ mappings: EM_ROWS, targets: EM_TARGETS, inline_tags: [] });
+});
+
 loadSettings();
+loadEmotionMap();
 loadModels();
 </script>
 </body>
