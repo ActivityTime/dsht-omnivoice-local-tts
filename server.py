@@ -1207,7 +1207,20 @@ _MODEL_INLINE_TAGS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 
 def _active_model_entry() -> dict[str, Any]:
-    entry = _find_model(MODEL_CONFIG, MODEL_CONFIG.get("active") or "")
+    """The registry entry for the checkpoint that is actually loaded.
+
+    Prefers ``_state["model_id"]`` (what really produced the audio) over
+    ``MODEL_CONFIG["active"]`` (what was requested). The two diverge when the
+    requested checkpoint fails to load: ``get_model()`` then silently falls
+    back to the base checkpoint and records that in ``_state["model_id"]``,
+    while the config still names the original. Trusting the config there
+    would let emotion tags reach a base checkpoint that cannot read them --
+    they would be spoken as literal words instead of being dropped.
+    """
+    loaded = _state.get("model_id")
+    entry = _find_model(MODEL_CONFIG, loaded or "") if loaded else None
+    if entry is None:
+        entry = _find_model(MODEL_CONFIG, MODEL_CONFIG.get("active") or "")
     return entry or {}
 
 
