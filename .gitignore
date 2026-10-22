@@ -12,6 +12,7 @@ server.log
 *.mp3
 *.wav
 __pycache__/
+/hf/
 
 # ===== 系统托盘图标（server.py 可确定性重建，删了会自动再生）=====
 /tray.ico

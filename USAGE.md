@@ -78,6 +78,8 @@ python\python.exe server.py > server.log 2>&1
 | `OMNIVOICE_DEVICE` | `cuda:0` | 设备；CPU 用 `cpu`（极慢） |
 | `OMNIVOICE_DTYPE` | `bfloat16` | `bfloat16` / `float16` / `float32` |
 | `OMNIVOICE_NUM_STEP` | `32` | 扩散步数，越大越慢越细 |
+| `OMNIVOICE_ASR_MODEL` | `models/whisper-large-v3-turbo`（项目内） | 逐字稿留空时 Whisper ASR 的模型位置；本地目录或 HF repo id 均可 |
+| `OMNIVOICE_ASR_DEVICE` | 空（跟随主模型） | 逐字稿留空时 Whisper ASR 的加载设备；显存不够时设 `cpu`（更慢但不占显存） |
 | `OMNIVOICE_GUIDANCE_SCALE` | `2.0` | 生成默认：引导强度（0–20） |
 | `OMNIVOICE_T_SHIFT` | `0.1` | 生成默认：时间步偏移（0–1，小=强调低 SNR） |
 | `OMNIVOICE_LAYER_PENALTY_FACTOR` | `5.0` | 生成默认：层惩罚因子（0–50，促使靠前 codebook 层先解码） |
@@ -175,32 +177,41 @@ curl http://127.0.0.1:8890/health
 | 项 | 要求 |
 |---|---|
 | 参考音频 | 3–10 秒（>20 秒官方会警告：更慢、更占内存、克隆质量下降），wav/mp3/flac/ogg |
-| `ref_text` | 参考音频的逐字稿。**可留空**——见下方「同目录自动取」 |
+| `ref_text` | 参考音频的逐字稿，**可留空**——留空时先找同目录同名文本，找不到就用 Whisper 自动转写（见下） |
 | 音色名称 | 可留空 = 用音频文件名（去扩展名）；已存在则自动追加 `_1`、`_2`… 不覆盖。手填的名称已存在则报 409 |
 
-**同目录自动取（ref_text 留空）**
+**逐字稿留空时发生什么（按优先级）**
 
-管理台的克隆卡片只走**本地音频路径**（音频文件的绝对路径，不要求在某个"库"里，任意位置都行）。
-`ref_text` 留空时，服务端直接读该音频**同目录**的同名文本，不做任何搜索/全库匹配：
+管理台的克隆卡片走**本地音频路径**（音频文件的绝对路径，不要求在某个"库"里，任意位置都行）。
+`ref_text` 留空时按顺序尝试：
 
-- 查找顺序：`<stem>.txt` → `<stem>.lab` → `<stem>.json`（json 取 `transcription` / `text` / `transcript`）。
-- 找不到直接报错，不会去触发 Whisper ASR（那要多吃约 3 GB 内存）。
-- 路径填目录 + 点「批量注册」则扫描目录下音频（按文件名排序，默认最多 20 条），
-  逐个取各自同目录的逐字稿，音色名 = 「音色名称」前缀 + 文件名。
+1. **同目录同名文本**（免费、最准）：`<stem>.txt` → `<stem>.lab` → `<stem>.json`
+   （json 取 `transcription` / `text` / `transcript`）。不做任何搜索/全库匹配。
+2. **Whisper 自动转写**：同目录也没有时，模型用自带的 Whisper
+   （`openai/whisper-large-v3-turbo`）转写。模型走**本地副本** `models/whisper-large-v3-turbo`
+   （与主模型同一约定，`OMNIVOICE_ASR_MODEL` 可覆盖指向别处），首次加载约 1.6GB 常驻 ASR 设备
+   （默认跟着主模型走 cuda:0，可用 `OMNIVOICE_ASR_DEVICE=cpu` 挪到内存）；每次转写几秒。
+   转写结果会写进音色元信息（`ref_text_source: "asr"`），控制台列表里带 `ASR` 标记。
+3. 手填永远优先级最高，也永远最准——逐字稿与音频不一致会让对齐漂移，克隆音质下降。
+
+路径填目录 + 点「批量注册」则扫描目录下音频（按文件名排序，默认最多 20 条），
+逐个取各自同目录的逐字稿，音色名 = 「音色名称」前缀 + 文件名。没有逐字稿的默认**跳过**；
+勾选「无逐字稿时 ASR 转写」（或 API 传 `asr=1`）才逐个自动转写。
+
 - 嫌打字麻烦就点路径框右侧的 **「选文件…」/「选目录…」**：由服务端进程弹出 Windows 原生
   选择框（PowerShell + WinForms，**无需额外依赖**），选中后自动回填绝对路径。取消则返回空。
 
 > 为什么界面不做浏览器上传/文件选择器：浏览器只能拿到文件名，拿不到绝对路径，
 > 也就读不到音频旁边的同名文本——那条路对"同目录取逐字稿"是假的。
-> `POST /admin/voices` 仍接受 `audio` 表单字段（`ref_text` 必填），供脚本/curl 使用
-> （素材库的 `scripts/register.py` 就走这条）。
+> `POST /admin/voices` 仍接受 `audio` 表单字段（`ref_text` 现在也可留空，走 ASR），
+> 供脚本/curl 使用（素材库的 `scripts/register.py` 就走这条）。
 
 **存储与缓存**（`voices/<name>.*`）：
 
 | 文件 | 内容 |
 |---|---|
 | `<name>.pt` | `VoiceClonePrompt.save()` 产物，约 7 KB（音频已 token 化，极小） |
-| `<name>.json` | 元信息：`ref_text`、时长、采样率、来源文件名、`preprocess_prompt`、创建时间 |
+| `<name>.json` | 元信息：`ref_text`（ASR 路径下为转写结果）、`ref_text_source`（`provided`/`asr`）、时长、采样率、来源文件名、`preprocess_prompt`、创建时间 |
 | `<name>.ref<ext>` | 原始参考音频，供页面回听 |
 
 进程内另有 `dict` 缓存已加载的 prompt，命中即不再读盘；**服务重启不丢失**（落在磁盘上）。
@@ -215,8 +226,8 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/voices` | 音色库列表（只读元信息，不加载 prompt） |
-| POST | `/admin/voices` | `name`（可空）+ `local_path`（服务端读盘，`ref_text` 可留空）+ `preprocess_prompt`（`"1"`/`"0"`，默认 `"1"`）；`audio` 上传字段仍兼容（`ref_text` 必填） |
-| POST | `/admin/import-local` | `path`（目录或文件）+ `prefix` + `limit` + `preprocess_prompt`：批量注册，逐字稿取音频同目录同名文本 |
+| POST | `/admin/voices` | `name`（可空）+ `local_path`（服务端读盘）+ `ref_text`（可空：同目录同名文本 → 找不到走 ASR）+ `preprocess_prompt`（`"1"`/`"0"`，默认 `"1"`）；`audio` 上传字段仍兼容（`ref_text` 可空，直走 ASR） |
+| POST | `/admin/import-local` | `path`（目录或文件）+ `prefix` + `limit` + `preprocess_prompt` + `asr`（`"1"`=无逐字稿的也自动转写，默认跳过）：批量注册 |
 | POST | `/admin/pick-path` | `{"mode":"file"|"dir","title","initial_dir"}`：服务端弹原生选择框，返回选中路径（空=取消） |
 | DELETE | `/admin/voices/{name}` | 删除音色及其参考音频 |
 | GET | `/admin/voices/{name}/audio` | 回听原始参考音频 |

@@ -310,9 +310,10 @@
         <label for="vcText">ref_text · 这段音频在说什么（可留空）</label>
         <input id="vcText" placeholder="啊啦~啊啦~，你在看什么呀？">
         <div class="hint">
-          <b>留空即可</b>：服务端直接读音频<b>同目录</b>的同名 <code>.txt</code> / <code>.lab</code> /
-          <code>.json</code>（json 取 <code>transcription</code>），不做任何搜索；找不到会直接报错，不会去跑 ASR。
-          手填则优先级更高。必须与音频内容逐字一致，多字少字都会让对齐漂移。
+          <b>留空也可以</b>：服务端先读音频<b>同目录</b>的同名 <code>.txt</code> / <code>.lab</code> /
+          <code>.json</code>（json 取 <code>transcription</code>），找不到就用 <b>Whisper 自动转写</b>
+          （本地模型，首次加载约 1.6GB 常驻显存，之后每条几秒；转写结果会存进音色元信息）。
+          手填最准——必须与音频内容逐字一致，多字少字都会让对齐漂移。
         </div>
       </div>
       <div style="grid-column:1/-1">
@@ -320,10 +321,13 @@
         <div class="row">
           <span class="hint" style="margin:0">把上面的路径填成<b>目录</b>，按文件名逐个注册；逐字稿同样取各音频同目录的同名文本。</span>
           <span class="spacer"></span>
+          <label class="check" title="没有同名逐字稿的音频也用 Whisper 自动转写（本地模型，首次加载约 1.6GB，每条几秒）">
+            <input id="vcAsr" type="checkbox"> 无逐字稿时 ASR 转写
+          </label>
           <input id="vcLimit" type="number" value="20" min="1" max="200" style="width:80px" title="最多注册几条">
           <button id="vcImport">批量注册</button>
         </div>
-        <div class="hint">「创建音色」用于单个文件；「批量注册」用于整个目录（前缀用上面的音色名称）。</div>
+        <div class="hint">「创建音色」用于单个文件；「批量注册」用于整个目录（前缀用上面的音色名称）。不勾 ASR 时，没有逐字稿的音频会被跳过。</div>
       </div>
     </div>
     <div class="row">
@@ -591,6 +595,7 @@ function renderVoiceList(items) {
         <span class="chip">${esc(v.name)}</span>
         ${v.duration ? `<span class="chip">${esc(v.duration)}s</span>` : ""}
         ${v.preprocess_prompt === false ? `<span class="chip" title="参考音频原样嵌入，未做去静音/裁切">raw</span>` : ""}
+        ${v.ref_text_source === "asr" ? `<span class="chip" title="逐字稿由 Whisper 自动转写">ASR</span>` : ""}
         ${v.created ? `<span class="meta">${esc(fmtTime(v.created))}</span>` : ""}
       </div>
       <div class="text">ref_text：${esc(v.ref_text || "-")}</div>
@@ -672,10 +677,16 @@ $("vcAdd").onclick = async () => {
     st.textContent = "请填「本地音频路径」——浏览器选文件拿不到绝对地址，读不到同目录的逐字稿";
     return;
   }
+  if (!manual && !confirm(
+    "未填逐字稿：服务端会先找音频同目录的同名文本，找不到就用 Whisper 自动转写" +
+    "（本地模型，首次加载约 1.6GB 常驻显存，每次转写几秒）。继续？"
+  )) return;
 
   btn.disabled = true;
   st.className = "busy";
-  st.textContent = name ? "正在克隆…（服务端读取本地音频）" : "正在克隆…（音色名取文件名）";
+  st.textContent = manual
+    ? (name ? "正在克隆…（服务端读取本地音频）" : "正在克隆…（音色名取文件名）")
+    : "正在克隆…（逐字稿留空，可能触发 Whisper 转写）";
   try {
     const fd = new FormData();
     fd.append("name", name);
@@ -690,8 +701,13 @@ $("vcAdd").onclick = async () => {
         (String(d.detail || "").includes("不是文件") ? "（目录请用「批量注册」）" : "");
       return;
     }
+    let msg = `已创建「${d.name}」，参考音频 ${d.duration}s。`;
+    if (d.ref_text_source === "asr") {
+      msg += ` 逐字稿由 Whisper 转写：「${d.ref_text || "(空)"}」`;
+    }
+    msg += " 上方 voice 填这个名字即可使用。";
     st.className = "ok";
-    st.textContent = `已创建「${d.name}」，参考音频 ${d.duration}s。上方 voice 填这个名字即可使用。`;
+    st.textContent = msg;
     $("vcName").value = ""; $("vcText").value = ""; $("vcPath").value = "";
     loadVoices();
   } catch (e) {
@@ -708,13 +724,16 @@ $("vcImport").onclick = async () => {
   if (!path) { st.className = "err"; st.textContent = "请先在「本地音频路径」填目录"; return; }
   btn.disabled = true;
   st.className = "busy";
-  st.textContent = "正在注册（逐字稿取音频同目录同名文本）…";
+  st.textContent = $("vcAsr").checked
+    ? "正在注册（无逐字稿的走 Whisper 转写，本地模型首次加载约 1.6GB）…"
+    : "正在注册（逐字稿取音频同目录同名文本）…";
   try {
     const body = new URLSearchParams({
       path,
       prefix: $("vcName").value.trim(),
       limit: $("vcLimit").value || "20",
       preprocess_prompt: $("vcPre").checked ? "1" : "0",
+      asr: $("vcAsr").checked ? "1" : "0",
     });
     const r = await fetch("/admin/import-local", {
       method: "POST",

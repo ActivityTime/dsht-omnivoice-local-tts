@@ -93,6 +93,16 @@ MODEL_ID = os.environ.get("OMNIVOICE_MODEL", str(HERE / "models" / "OmniVoice"))
 DEVICE = os.environ.get("OMNIVOICE_DEVICE", "cuda:0")
 DTYPE_NAME = os.environ.get("OMNIVOICE_DTYPE", "bfloat16").lower()
 NUM_STEP = int(os.environ.get("OMNIVOICE_NUM_STEP", "32"))
+# Where the optional Whisper ASR (auto-transcription when a clone is created
+# without ref_text) lives. Defaults to the locally-snapshotted copy next to
+# this file (same convention as MODEL_ID) so the first ASR request never needs
+# the network; override with OMNIVOICE_ASR_MODEL to pull from the hub again.
+# Its device defaults to the main model's device; set OMNIVOICE_ASR_DEVICE=cpu
+# when the GPU has no headroom for the extra ~1.6 GB.
+ASR_MODEL_ID = os.environ.get(
+    "OMNIVOICE_ASR_MODEL", str(HERE / "models" / "whisper-large-v3-turbo")
+)
+ASR_DEVICE = os.environ.get("OMNIVOICE_ASR_DEVICE", "").strip() or None
 API_KEY = os.environ.get("OMNI_TTS_KEY", "")  # empty = accept any key
 VOICES_FILE = Path(os.environ.get("OMNI_TTS_VOICES", HERE / "voices.json"))
 # DSH-Tavern sends `instructions` (an emotion phrase) only when the model name
@@ -363,8 +373,15 @@ def get_model():
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
         log.info("loading %s on %s as %s", MODEL_ID, DEVICE, DTYPE_NAME)
+        extra = {"asr_model_name": ASR_MODEL_ID}
+        if ASR_DEVICE:
+            extra["asr_device"] = ASR_DEVICE
         model = OmniVoice.from_pretrained(
-            MODEL_ID, device_map=DEVICE, dtype=resolve_dtype(), low_cpu_mem_usage=True
+            MODEL_ID,
+            device_map=DEVICE,
+            dtype=resolve_dtype(),
+            low_cpu_mem_usage=True,
+            **extra,
         )
         if torch.cuda.is_available():
             log.info("CUDA ready: %s", torch.cuda.get_device_name(0))
@@ -864,12 +881,18 @@ def _store_clone(
     name: str,
     wave: Any,
     sr: int,
-    ref_text: str,
+    ref_text: str | None,
     source: str,
     raw: bytes | None = None,
     preprocess_prompt: bool = True,
 ) -> dict[str, Any]:
     """Encode a voice-clone prompt and persist prompt + reference audio + meta.
+
+    `ref_text` may be empty: the model then auto-transcribes the reference
+    audio with its bundled Whisper ASR (local copy under
+    `models/whisper-large-v3-turbo`; override with OMNIVOICE_ASR_MODEL). The
+    transcript lands in the returned prompt, so it is recorded in meta.json
+    even though the caller supplied nothing.
 
     `preprocess_prompt` (OmniVoice default True) trims silence in the reference
     audio and appends a sentence-final punctuation to `ref_text` when missing.
@@ -879,16 +902,27 @@ def _store_clone(
     import torch  # noqa: PLC0415
 
     model = get_model()
+    auto_asr = not (ref_text or "").strip()
     try:
         prompt = model.create_voice_clone_prompt(
             ref_audio=(torch.from_numpy(wave).unsqueeze(0), int(sr)),
-            ref_text=ref_text,
+            ref_text=None if auto_asr else ref_text,
             preprocess_prompt=preprocess_prompt,
         )
     except Exception as error:  # noqa: BLE001
         log.exception("voice clone prompt failed")
+        if auto_asr:
+            raise HTTPException(
+                status_code=500,
+                detail=f"克隆失败（ASR 自动转写路径）：{error}。"
+                "ASR 模型默认位于项目 models/whisper-large-v3-turbo；"
+                "若移动过位置，设 OMNIVOICE_ASR_MODEL 指向它；"
+                "若显存不足，设 OMNIVOICE_ASR_DEVICE=cpu 可将 ASR 放到内存（更慢）。",
+            )
         raise HTTPException(status_code=500, detail=f"克隆失败：{error}")
 
+    # With ASR the transcript only exists inside the prompt; surface it.
+    resolved_text = str(prompt.ref_text or "")
     duration = float(np.asarray(wave).size) / float(sr)
     CLONE_DIR.mkdir(parents=True, exist_ok=True)
     prompt.save(str(CLONE_DIR / f"{name}{_CLONE_SUFFIX}"))
@@ -900,7 +934,8 @@ def _store_clone(
         json.dumps(
             {
                 "name": name,
-                "ref_text": ref_text,
+                "ref_text": resolved_text,
+                "ref_text_source": "asr" if auto_asr else "provided",
                 "duration": round(duration, 2),
                 "sample_rate": int(sr),
                 "source": source,
@@ -914,13 +949,20 @@ def _store_clone(
     )
     _clone_cache.pop(name, None)
     log.info(
-        "voice cloned: %s (%.1fs, %d chars ref_text, preprocess_prompt=%s)",
+        "voice cloned: %s (%.1fs, %d chars ref_text%s, preprocess_prompt=%s)",
         name,
         duration,
-        len(ref_text),
+        len(resolved_text),
+        ", auto-transcribed" if auto_asr else "",
         preprocess_prompt,
     )
-    return {"ok": True, "name": name, "duration": round(duration, 2)}
+    return {
+        "ok": True,
+        "name": name,
+        "duration": round(duration, 2),
+        "ref_text": resolved_text,
+        "ref_text_source": "asr" if auto_asr else "provided",
+    }
 
 
 @app.post("/admin/voices", include_in_schema=False)
@@ -939,12 +981,14 @@ async def admin_add_voice(
       disk, and when `ref_text` is empty the transcript is taken from the
       **same directory** (`<stem>.txt` / `.lab` / `.json`). No searching.
     * `audio` — a browser upload. Browsers cannot see sibling files, so an
-      empty `ref_text` is an error here unless the page already filled it in
-      from a same-named file the user selected alongside the audio.
+      empty `ref_text` goes straight to ASR here.
 
-    `ref_text` stays mandatory in effect: leaving it truly empty makes the
-    model load its Whisper ASR (~3 GB) to transcribe, and this host has no
-    commit memory to spare.
+    `ref_text` is optional in every mode. When it ends up empty the model
+    auto-transcribes the clip with its bundled Whisper ASR (local copy under
+    `models/whisper-large-v3-turbo`; override with OMNIVOICE_ASR_MODEL). The
+    transcript is stored in the voice metadata, and returned as
+    `ref_text_source: "asr"`. Hand-writing the transcript stays the most
+    accurate option — a wrong transcript misaligns the clone.
 
     An empty `name` is derived from the audio file name (extension stripped);
     on collision the first free `<stem>_1`, `<stem>_2`, … is taken instead of
@@ -986,21 +1030,9 @@ async def admin_add_voice(
             )
         name = _unique_clone_name(stem)
 
-    if not ref_text:
-        if not source_path:
-            raise HTTPException(
-                status_code=400,
-                detail="ref_text 必填：浏览器上传拿不到同目录的同名文本，请手填逐字稿，"
-                "或改用「本地音频路径」（服务端直接读音频同目录的 .txt/.lab/.json）。"
-                "留空会触发 ASR 自动转写，多占约 3GB 内存。",
-            )
+    if not ref_text and source_path:
+        # 留空 + 本地路径：先免费拿同目录逐字稿；没有再让 _store_clone 走 ASR
         ref_text = _sidecar_text(resolved)
-        if not ref_text:
-            raise HTTPException(
-                status_code=400,
-                detail=f"音频同目录没有与「{resolved.stem}」同名的 "
-                f".txt/.lab/.json：{resolved.parent}",
-            )
 
     wave, sr = _decode_audio(raw)
     return _store_clone(
@@ -1021,17 +1053,21 @@ def admin_import_local(
     limit: int = Form(20),
     overwrite: int = Form(0),
     preprocess_prompt: str = Form("1"),
+    asr: int = Form(0),
 ) -> dict[str, Any]:
     """Register every clip in a local directory.
 
     Reads the audio off disk and takes each transcript from the **same
     directory** (`<stem>.txt` / `.lab` / `.json`) — nothing is searched for.
-    Clips without a sibling transcript are skipped, never auto-transcribed.
+    By default clips without a sibling transcript are skipped.
 
     `path`       file or directory on the server host
     `prefix`     prepended to each stem to build the voice name
     `limit`      max clips to import from a directory (sorted by name)
     `preprocess_prompt`  "0" keeps reference audio verbatim (no silence trim)
+    `asr`        "1" = clips without a sibling transcript are auto-transcribed
+                 by the bundled Whisper ASR instead of skipped (first use
+                 downloads ~1.6 GB; each clip takes a few seconds)
     """
     resolved = _resolve_local(path)
     if not resolved.exists():
@@ -1048,14 +1084,17 @@ def admin_import_local(
 
     prefix_clean = _safe_name(prefix, trim=False) if (prefix or "").strip() else ""
     keep_raw = not _as_bool(preprocess_prompt)
+    use_asr = _as_bool(asr)
     created: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
 
     for f in files:
         text = _sidecar_text(f)
         if not text:
-            skipped.append({"file": f.name, "reason": "同目录没有同名 .txt/.lab/.json"})
-            continue
+            if not use_asr:
+                skipped.append({"file": f.name, "reason": "同目录没有同名 .txt/.lab/.json"})
+                continue
+            # asr=1：逐字稿留空，由 _store_clone 走 Whisper 自动转写
         name = _safe_name(f"{prefix_clean}{f.stem}") if prefix_clean else _safe_name(f.stem)
         if not name:
             skipped.append({"file": f.name, "reason": f"非法音色名：{f.stem}"})
