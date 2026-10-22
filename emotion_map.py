@@ -21,6 +21,12 @@ whichever the current model understands.
 The mapping table lives in `emotion_map.json` and is editable from the
 console. Matching is by longest substring, so "用温柔的语气说话" hits the
 "温柔" entry.
+
+A table can also be kept as a named preset. Two are built in -- one that
+aims everything at the finetune's delivery tags, one that aims at the
+official symbols and voice attributes -- and any number of user presets can
+be saved next to them in `emotion_presets.json`, then imported into the
+active table wholesale or on top of it.
 """
 from __future__ import annotations
 
@@ -33,6 +39,7 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 
 MAP_FILENAME = "emotion_map.json"
+PRESET_FILENAME = "emotion_presets.json"
 
 # The two families of inline tags, and why they are treated differently.
 #
@@ -42,9 +49,11 @@ MAP_FILENAME = "emotion_map.json"
 # finetune's eight are delivery and emotion (happy, sad, whisper, calm…)
 # and leave the timbre alone.
 #
-# So the default policy maps onto the finetune tags only, and treats the
-# official symbols -- and voice-design attributes, which change the voice
-# itself -- as blocked. `OMNI_TTS_EMOTION_MAP_OFFICIAL=1` lifts that.
+# Both families are therefore allowed by default: which one a phrase lands
+# on is the author's call, made by choosing a preset. Setting
+# `OMNI_TTS_EMOTION_MAP_OFFICIAL=0` keeps the official symbols and the
+# voice-design attributes out of play, leaving only the finetune tags --
+# useful when the phrasings really are meant as moods rather than sounds.
 OFFICIAL_INLINE_TAGS: tuple[str, ...] = (
     "laughter", "sigh", "confirmation-en", "question-en", "question-ah",
     "question-oh", "question-ei", "question-yi", "surprise-ah",
@@ -56,8 +65,14 @@ FINETUNE_INLINE_TAGS: tuple[str, ...] = (
 
 
 def official_enabled() -> bool:
-    """Whether mappings may point at official symbols and attributes."""
-    raw = str(os.environ.get("OMNI_TTS_EMOTION_MAP_OFFICIAL", "0")).strip().lower()
+    """Whether mappings may point at official symbols and attributes.
+
+    On by default -- the timbre trouble that made the official symbols look
+    harmful turned out to be a clone name being eaten by phrase matching,
+    not the symbols themselves. Turning it off restricts a table to the
+    finetune's delivery tags.
+    """
+    raw = str(os.environ.get("OMNI_TTS_EMOTION_MAP_OFFICIAL", "1")).strip().lower()
     return raw not in ("", "0", "false", "no", "off")
 
 
@@ -105,12 +120,10 @@ def map_path() -> Path:
     return Path(os.environ.get("OMNI_EMOTION_MAP", HERE / MAP_FILENAME))
 
 
-# The default table, used when no file exists yet.
-#
-# Everything a role-play front end sends -- DSH-Tavern's 28 emotions above
-# all -- is mapped onto the finetune's delivery tags, which colour the line
-# without replacing the speaker's voice. Entries are one target per phrase:
-# a phrase cannot carry both a quiet tag and a loud one.
+# The finetune-side table: everything -- DSH-Tavern's 28 emotions above all
+# -- aimed at the finetune's delivery tags, which colour the line without
+# replacing the speaker's voice. Entries are one target per phrase: a phrase
+# cannot carry both a quiet tag and a loud one.
 DEFAULT_MAPPING: dict[str, list[str]] = {
     # --- delivery: quiet / intimate (finetune tag `whisper`) ---
     "耳语": ["whisper"],
@@ -177,20 +190,24 @@ DEFAULT_MAPPING: dict[str, list[str]] = {
     "从容": ["calm"],
     # DSHT: 释然
     "释然": ["calm"],
+    # --- 事件型短语在微调侧的近似 ---
+    # These three are events rather than moods, and the finetune has no
+    # event tag, so the preset aims them at the nearest delivery. The
+    # built-in default table still reads them as events -- OFFICIAL_MAPPING
+    # wins there -- which is why they live here rather than there.
+    "不满": ["angry"],
+    "惊讶": ["excited"],
+    "恍然": ["calm"],
     # --- singing ---
     "唱歌": ["singing"],
     "哼唱": ["singing"],
     "歌唱": ["singing"],
 }
 
-# The loud ones: non-verbal events that take the voice over, kept out of
-# the default table on purpose and only merged in when
-# OMNI_TTS_EMOTION_MAP_OFFICIAL is on. Several name an event rather than a
-# delivery ("惊讶" is an "ah!", not a mood), which is exactly why they are
-# not what a voiced line wants by default.
-#
-# Single-character entries are avoided: "笑" would also bite into clone
-# names like "..._欢笑_疑问询问".
+# The event-shaped phrases: these name a sound rather than a mood ("惊讶"
+# is an "ah!", not a feeling), so they belong on the official symbols and
+# are kept in a group of their own. Single-character entries are avoided:
+# "笑" would also bite into clone names like "..._欢笑_疑问询问".
 OFFICIAL_MAPPING: dict[str, list[str]] = {
     "轻笑": ["laughter"],
     "偷笑": ["laughter"],
@@ -211,14 +228,110 @@ OFFICIAL_MAPPING: dict[str, list[str]] = {
 }
 
 
-def default_table() -> dict[str, list[str]]:
-    """The built-in table: the quiet tags and the loud ones.
+# The same phrases aimed at the other family: the official symbols, plus
+# `whisper` (a voice-design attribute). The official symbols carry no
+# emotion axis at all -- they are events -- so every mapping here is an
+# approximation, "the sound this mood most often makes". That is the point
+# of keeping it as a separate preset: pick it when you want the line to
+# *sound*, and the finetune preset when you want it to *feel*.
+#
+# `singing` is the one finetune tag kept here: nothing among the official
+# symbols can stand in for it.
+OFFICIAL_PRESET: dict[str, list[str]] = {
+    # --- quiet / intimate: `whisper` is a voice-design attribute ---
+    "耳语": ["whisper"],
+    "耳語": ["whisper"],
+    "轻声": ["whisper"],
+    "轻声道": ["whisper"],
+    "温柔": ["whisper"],
+    "温柔地": ["whisper"],
+    "溫柔": ["whisper"],
+    "柔和": ["whisper"],
+    "轻柔": ["whisper"],
+    "小声": ["whisper"],
+    "慵懒": ["whisper"],
+    "懒洋洋": ["whisper"],
+    "关心": ["whisper"],
+    "渴望": ["whisper"],
+    "害羞": ["whisper"],
+    "爱慕": ["whisper"],
+    # --- 正面 → 笑声 ---
+    "开心": ["laughter"],
+    "高兴": ["laughter"],
+    "愉快": ["laughter"],
+    "喜悦": ["laughter"],
+    "钦佩": ["laughter"],
+    "逗乐": ["laughter"],
+    "赞同": ["laughter"],
+    "感激": ["laughter"],
+    "得意": ["laughter"],
+    "兴奋": ["laughter"],
+    "激动": ["laughter"],
+    "雀跃": ["laughter"],
+    "轻笑": ["laughter"],
+    "偷笑": ["laughter"],
+    "笑声": ["laughter"],
+    # --- 低落 / 紧绷 → 叹气 ---
+    "难过": ["sigh"],
+    "伤心": ["sigh"],
+    "悲伤": ["sigh"],
+    "低落": ["sigh"],
+    "沮丧": ["sigh"],
+    "失望": ["sigh"],
+    "悲痛": ["sigh"],
+    "懊悔": ["sigh"],
+    "紧张": ["sigh"],
+    "不安": ["sigh"],
+    "焦虑": ["sigh"],
+    "忐忑": ["sigh"],
+    "叹气": ["sigh"],
+    "叹息": ["sigh"],
+    # --- 负面强 → 不满的哼声 ---
+    "生气": ["dissatisfaction-hnn"],
+    "愤怒": ["dissatisfaction-hnn"],
+    "恼怒": ["dissatisfaction-hnn"],
+    "发火": ["dissatisfaction-hnn"],
+    "火大": ["dissatisfaction-hnn"],
+    "烦躁": ["dissatisfaction-hnn"],
+    "嫌弃": ["dissatisfaction-hnn"],
+    "不满": ["dissatisfaction-hnn"],
+    "不屑": ["dissatisfaction-hnn"],
+    # --- 惊 / 疑 ---
+    "惊讶": ["surprise-ah"],
+    "驚訝": ["surprise-ah"],
+    "惊呼": ["surprise-ah"],
+    "害怕": ["surprise-ah"],
+    "恍然": ["surprise-oh"],
+    "好奇": ["surprise-oh"],
+    "期待": ["surprise-oh"],
+    "疑问": ["question-ah"],
+    "疑惑": ["question-ah"],
+    "不解": ["question-ah"],
+    "困惑": ["question-ah"],
+    "确认": ["confirmation-en"],
+    "肯定": ["confirmation-en"],
+    # --- 平缓 → 低缓柔和 ---
+    "平静": ["whisper"],
+    "冷静": ["whisper"],
+    "淡然": ["whisper"],
+    "从容": ["whisper"],
+    "释然": ["whisper"],
+    # --- 唱 ---
+    "唱歌": ["singing"],
+    "哼唱": ["singing"],
+    "歌唱": ["singing"],
+}
 
-    The loud entries are written out even though the default policy blocks
-    them, so that turning `OMNI_TTS_EMOTION_MAP_OFFICIAL` on has something
-    to enable without a reset; the console marks them as blocked.
+
+def default_table() -> dict[str, list[str]]:
+    """The built-in table: both families, finetune tags first.
+
+    A phrase that appears in both is kept at its finetune target, which is
+    the delivery reading; import the official preset to flip a whole table
+    over to the event reading.
     """
-    table = {key: list(value) for key, value in DEFAULT_MAPPING.items()}
+    table = {key: list(value) for key, value in OFFICIAL_PRESET.items()}
+    table.update({key: list(value) for key, value in DEFAULT_MAPPING.items()})
     table.update({key: list(value) for key, value in OFFICIAL_MAPPING.items()})
     return table
 
@@ -252,25 +365,197 @@ def load_map() -> dict[str, list[str]]:
     return default_table()
 
 
-def save_map(table: dict[str, list[str]]) -> None:
+def save_map(table: dict[str, list[str]], source: str | None = None) -> None:
+    """Store the active table, optionally naming the preset it came from.
+
+    Any later edit drops the name: `source` records provenance, and a table
+    that has been edited by hand is no longer that preset.
+    """
     path = map_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "source": (str(source).strip() or None) if source else None,
         "mappings": {
             key: _normalise(value) for key, value in sorted(table.items())
             if str(key).strip() and _normalise(value)
-        }
+        },
     }
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
 
 
+def load_meta() -> tuple[dict[str, list[str]], str | None]:
+    """The active table together with the preset it was imported from."""
+    path = map_path()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            data = None
+        if isinstance(data, dict):
+            source = data.get("source")
+            source = str(source).strip() if isinstance(source, str) and source.strip() else None
+            return load_map(), source
+    return load_map(), None
+
+
 def ensure_map() -> dict[str, list[str]]:
     """Write the default table out on first run so it can be edited."""
-    if not map_path().exists():
-        save_map(default_table())
+    path = map_path()
+    if not path.exists():
+        save_map(default_table(), DEFAULT_SOURCE)
+        return load_map()
+    # Files written before presets existed carry no "source". If one still
+    # holds the built-in default untouched, label it, so the console can say
+    # where the table came from instead of calling everything custom.
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return load_map()
+    if isinstance(data, dict) and "source" not in data:
+        table = load_map()
+        if table == default_table():
+            save_map(table, DEFAULT_SOURCE)
     return load_map()
+
+
+# --- presets ---------------------------------------------------------------
+#
+# A preset is a named table. Two ship with the service and are read-only --
+# their names belong to the code, so a user preset cannot shadow or delete
+# one. Everything else is stored in `emotion_presets.json`, next to the
+# active table, and can be created, overwritten and removed freely.
+DEFAULT_SOURCE = "内置默认"
+
+BUILTIN_PRESETS: dict[str, dict[str, list[str]]] = {
+    "微调映射模板": DEFAULT_MAPPING,
+    "官方映射模板": OFFICIAL_PRESET,
+}
+
+
+def presets_path() -> Path:
+    return Path(os.environ.get("OMNI_EMOTION_PRESETS", HERE / PRESET_FILENAME))
+
+
+def _normalise_table(raw: Any) -> dict[str, list[str]]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for key, value in raw.items():
+        phrase = str(key).strip()
+        targets = _normalise(value)
+        if phrase and targets:
+            out[phrase] = targets
+    return out
+
+
+def load_preset_file() -> dict[str, dict[str, list[str]]]:
+    """The user presets only, as stored on disk."""
+    path = presets_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    raw = data.get("presets")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, list[str]]] = {}
+    for name, entry in raw.items():
+        key = str(name).strip()
+        if not key or key in BUILTIN_PRESETS:
+            continue
+        body = entry.get("mappings") if isinstance(entry, dict) else entry
+        out[key] = _normalise_table(body)
+    return out
+
+
+def _write_preset_file(store: dict[str, dict[str, list[str]]]) -> None:
+    path = presets_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "presets": {
+            name: {"mappings": {k: _normalise(v) for k, v in sorted(table.items())}}
+            for name, table in sorted(store.items())
+        },
+    }
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def load_presets() -> dict[str, dict[str, list[str]]]:
+    """Every preset, built-in and user, by name."""
+    merged: dict[str, dict[str, list[str]]] = {
+        name: {key: list(value) for key, value in table.items()}
+        for name, table in BUILTIN_PRESETS.items()
+    }
+    merged.update(load_preset_file())
+    return merged
+
+
+def list_presets() -> list[dict[str, Any]]:
+    """Preset names for the console, built-ins first."""
+    presets = load_presets()
+    return [
+        {"name": name, "builtin": name in BUILTIN_PRESETS, "count": len(table)}
+        for name, table in sorted(
+            presets.items(), key=lambda kv: (kv[0] not in BUILTIN_PRESETS, kv[0])
+        )
+    ]
+
+
+def get_preset(name: str) -> dict[str, list[str]] | None:
+    table = load_presets().get(str(name or "").strip())
+    return {key: list(value) for key, value in table.items()} if table is not None else None
+
+
+def save_preset(name: str, table: dict[str, list[str]]) -> int:
+    """Store a table as a user preset. Built-in names are off limits."""
+    key = str(name or "").strip()
+    if not key:
+        raise ValueError("模板名不能为空")
+    if key in BUILTIN_PRESETS:
+        raise ValueError(f"「{key}」是内置模板，不能覆盖；请换一个名字")
+    store = load_preset_file()
+    store[key] = _normalise_table(table)
+    _write_preset_file(store)
+    return len(store[key])
+
+
+def delete_preset(name: str) -> bool:
+    key = str(name or "").strip()
+    if key in BUILTIN_PRESETS:
+        raise ValueError(f"「{key}」是内置模板，不能删除")
+    store = load_preset_file()
+    if key not in store:
+        return False
+    del store[key]
+    _write_preset_file(store)
+    return True
+
+
+def apply_preset(
+    current: dict[str, list[str]], name: str, mode: str = "replace"
+) -> dict[str, list[str]]:
+    """Import a preset into a table: `replace` swaps it, `merge` layers it.
+
+    Merging overwrites the phrases the preset knows and leaves everything
+    else alone, so several presets can be combined.
+    """
+    table = get_preset(name)
+    if table is None:
+        raise ValueError(f"没有名为「{name}」的模板")
+    if str(mode).strip().lower() == "merge":
+        merged = {key: list(value) for key, value in current.items()}
+        merged.update({key: list(value) for key, value in table.items()})
+        return merged
+    return {key: list(value) for key, value in table.items()}
 
 
 def _mask_protected(text: str, protected: tuple[str, ...]) -> str:

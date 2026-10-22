@@ -2421,18 +2421,15 @@ async def admin_settings_reset(request: Request) -> dict[str, Any]:
 
 # --- emotion map (adapter for DSH-Tavern's emotion phrases) ---------------
 
-@app.get("/admin/emotion-map", include_in_schema=False)
-def admin_emotion_map() -> dict[str, Any]:
-    """The mapping table, plus which targets the loaded checkpoint can use."""
-    if _emotion_map is None:
-        raise HTTPException(status_code=503, detail="emotion map unavailable")
+def _emotion_payload(table: dict[str, list[str]], source: str | None = None) -> dict[str, Any]:
+    """One response shape for everything that changes the mapping table."""
     valid, _, _, _ = _load_design_vocab()
     blocked = _emotion_map.blocked_targets(valid)
     inline_tags = _active_inline_tags()
-    table = _emotion_map.load_map()
     return {
         "ok": True,
         "map_file": str(_emotion_map.map_path()),
+        "preset_file": str(_emotion_map.presets_path()),
         "active_model": _state.get("model_id") or MODEL_CONFIG.get("active"),
         "inline_tags": list(inline_tags),
         "targets": _emotion_map.known_targets(inline_tags, valid),
@@ -2440,7 +2437,28 @@ def admin_emotion_map() -> dict[str, Any]:
         "count": len(table),
         "blocked": sorted(blocked),
         "official_enabled": _emotion_map.official_enabled(),
+        "presets": _emotion_map.list_presets(),
+        "source": source,
     }
+
+
+def _emotion_commit(table: dict[str, list[str]], source: str | None = None) -> dict[str, Any]:
+    """Store a table and refresh the copy the request path reads."""
+    _emotion_map.save_map(table, source)
+    # Update in place: a plain assignment here would create a local name
+    # and leave the module-level table -- the one the parser reads -- stale.
+    _EMOTION_TABLE.clear()
+    _EMOTION_TABLE.update(table)
+    return _emotion_payload(table, source)
+
+
+@app.get("/admin/emotion-map", include_in_schema=False)
+def admin_emotion_map() -> dict[str, Any]:
+    """The mapping table, plus which targets the loaded checkpoint can use."""
+    if _emotion_map is None:
+        raise HTTPException(status_code=503, detail="emotion map unavailable")
+    table, source = _emotion_map.load_meta()
+    return _emotion_payload(table, source)
 
 
 @app.post("/admin/emotion-map", include_in_schema=False)
@@ -2496,23 +2514,11 @@ async def admin_emotion_map_save(request: Request) -> dict[str, Any]:
     if errors:
         raise HTTPException(status_code=400, detail="；".join(errors))
 
-    _emotion_map.save_map(table)
-    # Update in place: a plain assignment here would create a local name
-    # and leave the module-level table -- the one the parser reads -- stale.
-    _EMOTION_TABLE.clear()
-    _EMOTION_TABLE.update(table)
-    valid, _, _, _ = _load_design_vocab()
-    blocked = _emotion_map.blocked_targets(valid)
-    inline_tags = _active_inline_tags()
-    return {
-        "ok": True,
-        "added": added,
-        "removed": removed,
-        "mappings": _emotion_map.describe(table, inline_tags, valid, blocked),
-        "count": len(table),
-        "blocked": sorted(blocked),
-        "official_enabled": _emotion_map.official_enabled(),
-    }
+    # An edit means the table is no longer whichever preset it came from.
+    payload = _emotion_commit(table, None)
+    payload["added"] = added
+    payload["removed"] = removed
+    return payload
 
 
 @app.post("/admin/emotion-map/reset", include_in_schema=False)
@@ -2520,24 +2526,101 @@ def admin_emotion_map_reset() -> dict[str, Any]:
     """Restore the built-in default table."""
     if _emotion_map is None:
         raise HTTPException(status_code=503, detail="emotion map unavailable")
-    # `default_table()` honours the official-tag switch, so a reset gives
-    # back exactly the policy's own defaults.
     table = _emotion_map.default_table()
-    _emotion_map.save_map(table)
-    # Update in place: a plain assignment here would create a local name
-    # and leave the module-level table -- the one the parser reads -- stale.
-    _EMOTION_TABLE.clear()
-    _EMOTION_TABLE.update(table)
-    valid, _, _, _ = _load_design_vocab()
-    blocked = _emotion_map.blocked_targets(valid)
-    inline_tags = _active_inline_tags()
-    return {
-        "ok": True,
-        "mappings": _emotion_map.describe(table, inline_tags, valid, blocked),
-        "count": len(table),
-        "blocked": sorted(blocked),
-        "official_enabled": _emotion_map.official_enabled(),
-    }
+    return _emotion_commit(table, _emotion_map.DEFAULT_SOURCE)
+
+
+@app.post("/admin/emotion-map/clear", include_in_schema=False)
+def admin_emotion_map_clear() -> dict[str, Any]:
+    """Empty the active table, so a preset can be built up from nothing."""
+    if _emotion_map is None:
+        raise HTTPException(status_code=503, detail="emotion map unavailable")
+    return _emotion_commit({}, None)
+
+
+@app.post("/admin/emotion-map/preset/apply", include_in_schema=False)
+async def admin_emotion_map_preset_apply(request: Request) -> dict[str, Any]:
+    """Import a preset: `replace` swaps the table, `merge` layers it on."""
+    if _emotion_map is None:
+        raise HTTPException(status_code=503, detail="emotion map unavailable")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="缺少模板名")
+    mode = str(body.get("mode") or "replace").strip().lower()
+    if mode not in ("replace", "merge"):
+        raise HTTPException(status_code=400, detail="mode 只能是 replace 或 merge")
+    current, _ = _emotion_map.load_meta()
+    try:
+        table = _emotion_map.apply_preset(current, name, mode)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    # A merge is its own thing rather than the preset, so only a clean
+    # replacement can claim the preset's name.
+    return _emotion_commit(table, name if mode == "replace" else None)
+
+
+@app.post("/admin/emotion-map/preset/save", include_in_schema=False)
+async def admin_emotion_map_preset_save(request: Request) -> dict[str, Any]:
+    """Store a table as a user preset, creating it or overwriting it.
+
+    With no `mappings` in the body the active table is what gets saved,
+    which is the "save as" the console does.
+    """
+    if _emotion_map is None:
+        raise HTTPException(status_code=503, detail="emotion map unavailable")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="缺少模板名")
+    raw = body.get("mappings")
+    if isinstance(raw, dict):
+        table = _emotion_map._normalise_table(raw)
+    elif raw is None:
+        table, _ = _emotion_map.load_meta()
+    else:
+        raise HTTPException(status_code=400, detail="mappings 必须是对象")
+    try:
+        count = _emotion_map.save_preset(name, table)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    payload = _emotion_payload(table)
+    payload["saved"] = {"name": name, "count": count}
+    return payload
+
+
+@app.post("/admin/emotion-map/preset/delete", include_in_schema=False)
+async def admin_emotion_map_preset_delete(request: Request) -> dict[str, Any]:
+    """Remove a user preset. The active table is left alone."""
+    if _emotion_map is None:
+        raise HTTPException(status_code=503, detail="emotion map unavailable")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="缺少模板名")
+    try:
+        removed = _emotion_map.delete_preset(name)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    table, source = _emotion_map.load_meta()
+    payload = _emotion_payload(table, source)
+    payload["removed"] = bool(removed)
+    return payload
 
 
 def _detect_model_type(folder: Path) -> str | None:

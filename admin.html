@@ -459,8 +459,27 @@
       <button id="emReload">重新载入</button>
       <button id="emSave" class="primary">保存映射</button>
       <button id="emReset" class="danger">恢复内置默认</button>
+      <button id="emClear" class="danger">清空</button>
       <span class="spacer"></span>
       <span class="stats" id="emStats"></span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="meta" style="min-width:60px">映射模板</span>
+      <select id="emPresetSel" style="min-width:210px"></select>
+      <button id="emPresetApply">替换导入</button>
+      <button id="emPresetMerge">追加导入</button>
+      <button id="emPresetDelete" class="danger">删除模板</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <input id="emPresetName" type="text" placeholder="模板名，如 自定义映射模板#名字1" style="flex:1;min-width:220px">
+      <button id="emPresetSave">保存 / 覆盖为模板</button>
+      <span class="meta" id="emPresetHint"></span>
+    </div>
+    <div class="hint" style="margin:6px 0 0">
+      <b>替换导入</b>：整张表换成模板内容（当前表会被覆盖）。
+      <b>追加导入</b>：模板里的条目并入当前表，同名覆盖、其余保留。
+      <b>保存为模板</b>：把当前生效表存成新模板（内置模板名不可占用）；
+      想从零建组就先「清空」再保存。
     </div>
     <div class="row" style="margin-top:8px">
       <input id="emPhrase" type="text" placeholder="DSHT 情绪短语，如 温柔地" style="flex:1;min-width:180px">
@@ -1470,6 +1489,8 @@ $("cfgReset").onclick = async () => {
 /* ---------- emotion map (DSHT adapter) ---------- */
 let EM_ROWS = [];
 let EM_TARGETS = [];
+let EM_PRESETS = [];
+let EM_SOURCE = null;
 const EM_EDITED = new Map();
 const EM_REMOVED = new Set();
 
@@ -1480,12 +1501,43 @@ function emTargetLabel(t) {
   return "未知";
 }
 
+function renderPresetSelect(source) {
+  const sel = $("emPresetSel");
+  const keep = sel.value;
+  sel.innerHTML = EM_PRESETS.map((p) =>
+    `<option value="${esc(p.name)}">${esc(p.name)}${p.builtin ? "（内置）" : ""} · ${p.count} 条</option>`
+  ).join("");
+  const want = source && EM_PRESETS.some((p) => p.name === source) ? source : keep;
+  if (want && EM_PRESETS.some((p) => p.name === want)) sel.value = want;
+  else if (EM_PRESETS.length) sel.value = EM_PRESETS[0].name;
+  syncPresetName();
+}
+
+function syncPresetName() {
+  const sel = $("emPresetSel");
+  const cur = EM_PRESETS.find((p) => p.name === sel.value);
+  const hint = $("emPresetHint");
+  if (cur && cur.builtin) {
+    hint.textContent = "内置模板只读：可导入，不能覆盖或删除。";
+  } else if (cur) {
+    hint.textContent = "自定义模板：可覆盖、可删除。";
+  } else {
+    hint.textContent = "";
+  }
+}
+
 function renderEmotionMap(data) {
   EM_ROWS = data.mappings || [];
   EM_TARGETS = data.targets || [];
+  if (data.presets) {
+    EM_PRESETS = data.presets;
+    renderPresetSelect(data.source);
+  }
+  if ("source" in data) EM_SOURCE = data.source;
   const avail = (data.inline_tags || []).length;
+  const src = EM_SOURCE ? `来自模板「${EM_SOURCE}」` : "自定义（未保存为模板）";
   $("emStats").textContent =
-    `${EM_ROWS.length} 条映射 · 当前模型支持 ${avail} 个行内标签 · ` +
+    `${EM_ROWS.length} 条映射 · 当前模型支持 ${avail} 个行内标签 · ${src} · ` +
     `官方标签与属性${data.official_enabled ? "已启用" : "已禁用"}（配置页可切换）`;
 
   const needle = ($("emFilter").value || "").trim().toLowerCase();
@@ -1632,6 +1684,75 @@ $("emReset").onclick = async () => {
 };
 
 $("emReload").onclick = () => { EM_EDITED.clear(); EM_REMOVED.clear(); loadEmotionMap(); };
+
+/* --- mapping presets (模板) --- */
+function emPickedName() {
+  return ($("emPresetSel").value || "").trim();
+}
+
+function emTypedName() {
+  return ($("emPresetName").value || "").trim();
+}
+
+async function emPost(url, body, okMsg) {
+  const r = await api(url, { method: "POST", body: JSON.stringify(body) });
+  const d = await r.json();
+  if (!r.ok) {
+    $("emStatus").innerHTML = `<div class="text" style="color:var(--err)">失败：${esc(d.detail || r.status)}</div>`;
+    return null;
+  }
+  EM_EDITED.clear();
+  EM_REMOVED.clear();
+  renderEmotionMap(d);
+  $("emStatus").innerHTML = `<div class="hint">${esc(okMsg)}</div>`;
+  return d;
+}
+
+$("emPresetSel").addEventListener("change", () => {
+  const cur = EM_PRESETS.find((p) => p.name === emPickedName());
+  if (cur && !cur.builtin && !emTypedName()) $("emPresetName").value = cur.name;
+  syncPresetName();
+});
+
+$("emPresetApply").onclick = async () => {
+  const name = emPickedName();
+  if (!name) return;
+  if (!confirm(`把当前生效表整张替换为「${name}」？未保存的修改会丢失。`)) return;
+  await emPost("/admin/emotion-map/preset/apply", { name: name, mode: "replace" },
+    `已用「${name}」替换当前生效表。`);
+};
+
+$("emPresetMerge").onclick = async () => {
+  const name = emPickedName();
+  if (!name) return;
+  await emPost("/admin/emotion-map/preset/apply", { name: name, mode: "merge" },
+    `已把「${name}」并入当前生效表（同名覆盖）。`);
+};
+
+$("emPresetSave").onclick = async () => {
+  const name = emTypedName() || emPickedName();
+  if (!name) {
+    $("emStatus").innerHTML = '<div class="hint">先填一个模板名。</div>';
+    return;
+  }
+  const exists = EM_PRESETS.some((p) => p.name === name);
+  if (exists && !confirm(`模板「${name}」已存在，用当前生效表覆盖它？`)) return;
+  const d = await emPost("/admin/emotion-map/preset/save", { name: name },
+    `已把当前 ${exists ? "覆盖到" : "保存为"}模板「${name}」。`);
+  if (d) $("emPresetName").value = "";
+};
+
+$("emPresetDelete").onclick = async () => {
+  const name = emPickedName();
+  if (!name) return;
+  if (!confirm(`删除模板「${name}」？当前生效表不受影响。`)) return;
+  await emPost("/admin/emotion-map/preset/delete", { name: name }, `已删除模板「${name}」。`);
+};
+
+$("emClear").onclick = async () => {
+  if (!confirm("清空当前生效的映射表？（模板不受影响，可随时再导入）")) return;
+  await emPost("/admin/emotion-map/clear", {}, "已清空当前生效表。");
+};
 
 $("emFilter").addEventListener("input", () => {
   renderEmotionMap({ mappings: EM_ROWS, targets: EM_TARGETS, inline_tags: [] });
