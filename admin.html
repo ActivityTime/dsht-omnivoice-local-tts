@@ -100,6 +100,7 @@
   .text { font-size: 13px; white-space: pre-wrap; word-break: break-word; margin-bottom: 8px; }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
   .chip { font-size: 11.5px; font-family: var(--mono); color: var(--text-dim); background: var(--bg-soft); border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px; }
+  .chip-warn { color: #c0392b; border-color: #c0392b; background: rgba(192,57,43,.10); font-weight: 600; }
   .chip-btn { cursor: pointer; font-family: inherit; }
   .chip-btn:hover { border-color: var(--accent); color: var(--accent); }
   audio { width: 100%; height: 36px; margin: 4px 0 8px; }
@@ -781,7 +782,8 @@ function renderVoiceList(items) {
         <span class="badge src">clone</span>
         <span class="chip">${esc(v.name)}</span>
         ${v.duration ? `<span class="chip">${esc(v.duration)}s</span>` : ""}
-        ${v.preprocess_prompt === false ? `<span class="chip" title="参考音频原样嵌入，未做去静音/裁切">raw</span>` : ""}
+        ${v.preprocess_prompt === true ? `<span class="chip chip-warn" title="参考音频已去静音/裁切（旧版默认，可能读得急；建议重新克隆该音色）">预处理</span>` : ""}
+        ${v.preprocess_prompt === false ? `<span class="chip" title="参考音频原样嵌入，未做去静音/裁切">原样</span>` : ""}
         ${v.ref_text_source === "asr" ? `<span class="chip" title="逐字稿由 Whisper 自动转写">ASR</span>` : ""}
         ${v.created ? `<span class="meta">${esc(fmtTime(v.created))}</span>` : ""}
       </div>

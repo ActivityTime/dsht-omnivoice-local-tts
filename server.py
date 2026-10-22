@@ -2033,11 +2033,21 @@ async def speech(request: Request, authorization: str | None = Header(default=No
     voice_report = {
         "dropped": voice_parts.dropped,
         "matched_clone": voice_parts.clone_name,
+        "clone_preprocessed": _clone_preprocessed(voice_parts.clone_name),
         "inline_tags": voice_parts.inline_tags,
         "presets": voice_parts.presets,
         # What the caller actually sent, so the archive can be read back.
         "instructions": instructions,
         "emotion_mapped": voice_parts.emotion_mapped,
+        # Voice-group resolution trace: which group fired, what sub-tag matched,
+        # and whether we fell back to the mandatory group default. Without this
+        # the archive cannot tell that "甘雨" actually resolved to a specific
+        # member voice (or to the default) -- the real voice is invisible.
+        "group_name": voice_parts.group_name,
+        "group_default": voice_parts.group_default,
+        "group_selected": voice_parts.group_selected,
+        "group_tag": voice_parts.group_tag,
+        "group_fell_back": voice_parts.group_fell_back,
     }
     client = request.client.host if request.client else ""
     started = time.perf_counter()
@@ -2108,10 +2118,29 @@ async def speech(request: Request, authorization: str | None = Header(default=No
         return JSONResponse({"error": {"message": f"generation failed: {error}"}}, status_code=500)
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-    log.info(
-        "tts ok: %d chars, voice=%r, instruct=%r, %d bytes %s",
-        len(text), voice, instruct, len(payload), fmt,
-    )
+    grp_bits: list[str] = []
+    if voice_parts.group_name:
+        grp_bits.append(f"group={voice_parts.group_name}")
+        if voice_parts.group_tag:
+            grp_bits.append(f"tag={voice_parts.group_tag}")
+        if voice_parts.group_fell_back:
+            grp_bits.append("fell_back_to_default")
+        else:
+            grp_bits.append(f"member={voice_parts.group_selected}")
+    group_suffix = f" [{', '.join(grp_bits)}]" if grp_bits else ""
+    if voice_parts.clone_name:
+        pp = voice_report["clone_preprocessed"]
+        pp_tag = "" if pp is None else (" preprocess" if pp else " raw")
+        log.info(
+            "tts ok: %d chars, voice=%r -> matched=%r%s%s, instruct=%r, %d bytes %s",
+            len(text), voice, voice_parts.clone_name, group_suffix, pp_tag,
+            instruct, len(payload), fmt,
+        )
+    else:
+        log.info(
+            "tts ok: %d chars, voice=%r (design/attribute, no clone)%s, instruct=%r, %d bytes %s",
+            len(text), voice, group_suffix, instruct, len(payload), fmt,
+        )
     if key is not None:
         _cache_stats["misses"] += 1
         cache_put(key, payload, fmt, echo=gen_overrides)
@@ -2978,6 +3007,27 @@ def _decode_audio(raw: bytes) -> tuple[Any, int]:
     return wave, int(sr)
 
 
+def _clone_preprocessed(name: str | None) -> bool | None:
+    """Whether a stored clone was built with ``preprocess_prompt=True``.
+
+    True  => reference audio was silence-trimmed (legacy default; may sound rushed)
+    False => reference audio embedded verbatim (current default)
+    None  => unknown / no metadata for that name
+
+    Read live from the clone's ``.json`` so a re-clone with the new default
+    shows up in logs and the console without a restart.
+    """
+    if not name:
+        return None
+    meta = CLONE_DIR / f"{name}.json"
+    if not meta.exists():
+        return None
+    try:
+        return bool(json.loads(meta.read_text(encoding="utf-8")).get("preprocess_prompt"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _store_clone(
     name: str,
     wave: Any,
@@ -3618,8 +3668,14 @@ async def admin_generate(request: Request):
         # What each item in the voice field resolved to.
         "dropped": voice_parts.dropped,
         "matched_clone": voice_parts.clone_name,
+        "clone_preprocessed": _clone_preprocessed(voice_parts.clone_name),
         "inline_tags": voice_parts.inline_tags,
         "presets": voice_parts.presets,
+        "group_name": voice_parts.group_name,
+        "group_default": voice_parts.group_default,
+        "group_selected": voice_parts.group_selected,
+        "group_tag": voice_parts.group_tag,
+        "group_fell_back": voice_parts.group_fell_back,
     }
 
     started = time.perf_counter()
