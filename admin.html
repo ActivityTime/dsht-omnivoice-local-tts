@@ -47,6 +47,10 @@
     background: var(--bg-soft); border-bottom: 1px solid var(--line);
   }
   header h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: .3px; }
+  .anchors { display: flex; gap: 8px 12px; flex-basis: 100%; flex-wrap: wrap; }
+  .anchors a { font-size: 12.5px; color: var(--text-dim); border: 1px solid var(--line); border-radius: 20px; padding: 3px 12px; }
+  .anchors a:hover { color: var(--accent); border-color: var(--accent); text-decoration: none; }
+  .anchors a.accent { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-dim); display: inline-block; }
   .dot.on { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
   .dot.off { background: var(--err); }
@@ -62,7 +66,7 @@
   button.primary:hover { background: var(--accent-2); }
   button.danger:hover { border-color: var(--err); color: var(--err); }
   main { max-width: 1180px; margin: 0 auto; padding: 18px 20px; display: grid; gap: 18px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; scroll-margin-top: 86px; }
   .card h2 { margin: 0 0 12px; font-size: 14px; font-weight: 650; color: var(--text-dim); letter-spacing: .5px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 5px; }
@@ -104,6 +108,22 @@
   code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-soft); padding: 1px 4px; border-radius: 4px; }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
+  .badge.hit { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+  .badge.miss { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, var(--line)); }
+  .logtable { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+  .logtable th, .logtable td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .logtable th { color: var(--text-dim); font-weight: 600; font-size: 11px; letter-spacing: .3px; position: sticky; top: 0; background: var(--card); }
+  .logtable td.meta { color: var(--text-dim); font-family: var(--mono); }
+  .logtable td.txt { color: var(--text-dim); font-family: var(--mono); max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .logtable tr:hover td { background: var(--card-2); }
+  h3.sub { margin: 16px 0 8px; font-size: 13px; font-weight: 650; color: var(--text-dim); }
+  .tag { display: inline-block; font-size: 11px; font-family: var(--mono); padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--text-dim); background: var(--bg-soft); margin-left: 6px; vertical-align: middle; }
+  .tag.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+  .tag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, var(--line)); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row + .row { margin-top: 8px; }
+  select, input[type="text"], input[type="number"] { background: var(--bg-soft); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font-size: 13px; font-family: inherit; }
+  select:focus, input:focus { outline: 1px solid var(--accent); }
 </style>
 </head>
 <body>
@@ -113,10 +133,17 @@
   <span class="meta" id="health">连接中…</span>
   <span class="spacer"></span>
   <button id="theme">切换主题</button>
+  <nav class="anchors">
+    <a href="#synthesize">发起合成</a>
+    <a href="#voices">音色库</a>
+    <a href="#history">历史记录</a>
+    <a href="#models">模型管理</a>
+    <a href="#apirec" class="accent">API 记录 / 请求日志</a>
+  </nav>
 </header>
 
 <main>
-  <section class="card">
+  <section class="card" id="synthesize">
     <h2>发起合成请求</h2>
     <label for="text">文本内容</label>
     <textarea id="text" placeholder="输入要合成的文本…">你好，这是一段来自 OmniVoice 的语音合成测试。</textarea>
@@ -126,9 +153,10 @@
         <label for="voice">声音 / 属性描述</label>
         <input id="voice" list="voiceList" value="alloy" placeholder="alloy 或 female, elderly, 四川话">
         <datalist id="voiceList"></datalist>
-        <div class="hint">预设名走映射；不在列表里的值当作文字造声属性直接透传。点下方标签可拼装（英文项后自动补 ", "，中文项补 "，"）。</div>
+        <div class="hint">可直接填<b>预设语音名</b>（alloy/echo/fable… 见下方「预设」标签，点一下即填入，悬停看对应属性），或留空走默认 alloy；不在预设里的值当作文字造声属性直接透传。下方英文/中文标签可点选拼装属性（英文项后自动补 ", "，中文项补 "，"）。</div>
         <div class="chips" id="attrEn" style="margin-top:7px"></div>
         <div class="chips" id="attrZh"></div>
+        <div class="chips" id="presetVoices" style="margin-top:7px"></div>
       </div>
       <div>
         <label for="instructions">附加属性（可选）</label>
@@ -282,7 +310,7 @@
     <div id="latest"></div>
   </section>
 
-  <section class="card">
+  <section class="card" id="voices">
     <h2>声音克隆 · 音色库</h2>
     <div class="grid">
       <div>
@@ -297,7 +325,7 @@
       <div>
         <label for="vcPath">本地音频路径</label>
         <div class="row" style="margin-top:5px">
-          <input id="vcPath" style="flex:1" placeholder="I:\SomeResources\VoiceClonePrompt-ForOmniVoice\prompt\genshin\zh\Raiden_Shogun\clips\zh_Raiden_Shogun_0001.wav">
+          <input id="vcPath" style="flex:1" placeholder="音频文件的绝对路径，例如 <媒体库>/clips/voice_0001.wav">
           <button id="vcPickFile" type="button">选文件…</button>
           <button id="vcPickDir" type="button">选目录…</button>
         </div>
@@ -342,7 +370,7 @@
     <div id="vcList" style="margin-top:14px"><div class="empty">加载中…</div></div>
   </section>
 
-  <section class="card">
+  <section class="card" id="history">
     <h2>请求记录</h2>
     <div class="toolbar">
       <button id="refresh">刷新</button>
@@ -355,6 +383,63 @@
       <span class="stats" id="stats"></span>
     </div>
     <div id="records"><div class="empty">加载中…</div></div>
+  </section>
+
+  <section class="card" id="models">
+    <h2>模型管理 <span class="meta">（运行时切换 · 持久化生效）</span></h2>
+
+    <h3 class="sub">当前模型</h3>
+    <div id="mCurrent"><div class="empty">加载中…</div></div>
+
+    <h3 class="sub">已注册模型</h3>
+    <div class="row">
+      <select id="mSelect" style="min-width:280px;flex:1"></select>
+      <button id="mLoad">加载并设为当前</button>
+      <button id="mScan">扫描目录</button>
+      <button id="mDelete" class="danger">删除所选</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="meta">切换会重建模型（显存重载，约需数十秒），并在重启后保持。</span>
+    </div>
+    <div id="mList" style="margin-top:12px"><div class="empty">加载中…</div></div>
+
+    <h3 class="sub">注册新模型</h3>
+    <div class="row">
+      <input id="mId" type="text" placeholder="id（唯一标识，如 my-emotion）" style="flex:1;min-width:200px">
+      <input id="mName" type="text" placeholder="显示名称" style="flex:1;min-width:160px">
+    </div>
+    <div class="row">
+      <input id="mPath" type="text" placeholder="本地目录路径（模型权重所在目录）" style="flex:1;min-width:280px">
+      <select id="mType">
+        <option value="checkpoint">checkpoint（完整权重）</option>
+        <option value="lora">lora（适配器，叠加到基座）</option>
+      </select>
+      <button id="mRegister">注册</button>
+    </div>
+    <div class="row">
+      <span class="meta" id="mScanInfo"></span>
+    </div>
+  </section>
+
+  <section class="card" id="apirec">
+    <h2>API 记录 <span class="meta">（语音服务 /v1/audio/speech）</span></h2>
+    <div class="toolbar">
+      <button id="apiRefresh">刷新</button>
+      <button id="apiClear" class="danger">清空音频记录</button>
+      <label class="check" style="margin-left:4px">
+        显示条数
+        <input id="apiLimit" type="number" min="1" max="500" value="50" style="width:80px">
+      </label>
+      <span class="spacer"></span>
+      <span class="stats" id="apiStats"></span>
+    </div>
+
+    <h3 class="sub">请求日志（最近 N 条，含缓存命中与失败）</h3>
+    <div id="apiLog"><div class="empty">加载中…</div></div>
+
+    <h3 class="sub">音频记录与轮转</h3>
+    <div id="apiRotation" class="stats" style="margin-bottom:8px"></div>
+    <div id="apiRecords"><div class="empty">加载中…</div></div>
   </section>
 </main>
 
@@ -369,6 +454,7 @@ const ATTR_ZH = ["女", "男", "儿童", "少年", "青年", "中年", "老年",
   "四川话", "东北话", "云南话", "宁夏话", "桂林话", "河南话", "济南话",
   "甘肃话", "石家庄话", "贵州话", "陕西话", "青岛话"];
 let PRESET = [];
+let PRESET_ATTRS = {};
 
 const $ = (id) => document.getElementById(id);
 const api = (p, opt) => fetch(p, Object.assign({ headers: { "Content-Type": "application/json" } }, opt || {}));
@@ -410,6 +496,8 @@ async function loadHealth() {
     $("health").textContent = [h.loaded ? "模型已加载" : "模型未加载",
       h.device, h.dtype, h.cuda ? "CUDA" : "CPU"].filter(Boolean).join(" · ");
     PRESET = h.voices || [];
+    PRESET_ATTRS = h.voice_attrs || {};
+    renderPresets();
     CLONES = h.clones || [];
     applyGenDefaults(Object.assign({ __num_step: h.num_step_default }, h.gen_defaults));
     loadLanguages();
@@ -432,6 +520,16 @@ function renderAttrs() {
   $("attrZh").innerHTML = `<span class="chip" style="border:none;background:none;padding-left:0">中文</span>` + mk(ATTR_ZH, true);
   document.querySelectorAll(".chip-btn").forEach((b) => {
     b.onclick = () => appendAttr(b.dataset.attr, b.dataset.zh === "1");
+  });
+}
+
+function renderPresets() {
+  const mk = (name) => `<button type="button" class="chip chip-btn" data-preset="${esc(name)}" title="${esc(PRESET_ATTRS[name] || "")}">${esc(name)}</button>`;
+  const items = (PRESET || []).map(mk).join("");
+  const head = `<span class="chip" style="border:none;background:none;padding-left:0">预设</span>`;
+  $("presetVoices").innerHTML = head + (items || `<span class="chip" style="border:none;background:none">（无）</span>`);
+  document.querySelectorAll("#presetVoices .chip-btn").forEach((b) => {
+    b.onclick = () => { $("voice").value = b.dataset.preset; };
   });
 }
 
@@ -783,7 +881,12 @@ async function loadHistory() {
     $("records").innerHTML = `<div class="empty">读取记录失败：${esc(e)}</div>`;
     return;
   }
-  $("stats").textContent = `共 ${data.total} 条 · 成功 ${data.ok} · 失败 ${data.failed} · 产出 ${fmtBytes(data.bytes_total)}`;
+  const hr = data.rotation || {};
+  const hl = hr.limits || {};
+  const hage = hr.oldest_age_days != null ? ` · 最旧 ${hr.oldest_age_days} 天` : "";
+  $("stats").textContent =
+    `共 ${data.total} 条 · 成功 ${data.ok} · 失败 ${data.failed} · 产出 ${fmtBytes(data.bytes_total)}` +
+    ` · 轮转 当前 ${fmtBytes(hr.bytes || 0)} / ${hr.entries || 0} 条（阈值 ${fmtBytes(hl.bytes || 0)} / ${hl.entries || 0} 条 / ${hl.age_days || 0} 天）${hage}`;
   const items = data.items || [];
   if (!items.length) {
     $("records").innerHTML = `<div class="empty">暂无记录。上面发一次请求就会在这里留档。</div>`;
@@ -823,6 +926,119 @@ async function loadHistory() {
     </div>`;
   }).join("");
 }
+
+/* ---------- API records (OpenAI endpoint) ---------- */
+function cacheBadge(c) {
+  if (c === "hit") return `<span class="badge hit">HIT</span>`;
+  if (c === "miss") return `<span class="badge miss">MISS</span>`;
+  return `<span class="badge">off</span>`;
+}
+
+async function loadApiLog() {
+  let data;
+  try {
+    const r = await api("/admin/api-log?limit=100");
+    data = await r.json();
+  } catch (e) {
+    $("apiLog").innerHTML = `<div class="empty">读取请求日志失败：${esc(e)}</div>`;
+    return;
+  }
+  const c = data.cache || {};
+  const lim = c.limits || {};
+  $("apiStats").textContent =
+    `缓存 命中 ${c.hits || 0} / 未命中 ${c.misses || 0} / 写入 ${c.puts || 0}` +
+    (c.enabled ? ` · 磁盘 ${fmtBytes(c.bytes)} / ${c.entries} 条（上限 ${fmtBytes(lim.bytes)} / ${lim.entries} 条 / ${lim.age_days} 天）` : " · 已禁用");
+  const items = data.items || [];
+  if (!items.length) {
+    $("apiLog").innerHTML = `<div class="empty">暂无 API 请求。用 /v1/audio/speech 发一次请求就会出现在左侧表格。</div>`;
+    return;
+  }
+  $("apiLog").innerHTML = `<table class="logtable"><thead><tr>
+    <th>时间</th><th>状态</th><th>缓存</th><th>音色</th><th>模式</th><th>格式</th><th>耗时</th><th>字节</th><th>文本</th>
+  </tr></thead><tbody>
+    ${items.map((r) => `<tr>
+      <td class="meta">${esc(fmtTime(r.time))}</td>
+      <td><span class="badge ${r.status === "ok" ? "ok" : "err"}">${esc(r.status)}</span></td>
+      <td>${cacheBadge(r.cache)}</td>
+      <td>${esc(r.voice)}</td>
+      <td class="meta">${esc(r.voice_mode || "")}</td>
+      <td>${esc(r.format)}</td>
+      <td class="meta">${r.elapsed_ms != null ? r.elapsed_ms + "ms" : ""}</td>
+      <td class="meta">${r.bytes ? fmtBytes(r.bytes) : ""}</td>
+      <td class="txt" title="${esc(r.text)}">${esc(r.text)}</td>
+    </tr>`).join("")}
+  </tbody></table>`;
+}
+
+async function loadApiRecords() {
+  const limit = Math.max(1, Math.min(500, Number($("apiLimit").value || 50)));
+  let data;
+  try {
+    const r = await api("/admin/api-records?limit=" + limit);
+    data = await r.json();
+  } catch (e) {
+    $("apiRecords").innerHTML = `<div class="empty">读取音频记录失败：${esc(e)}</div>`;
+    return;
+  }
+  const rot = data.rotation || {};
+  const lim = rot.limits || {};
+  const age = rot.oldest_age_days != null ? ` · 最旧 ${rot.oldest_age_days} 天` : "";
+  $("apiRotation").textContent =
+    `共 ${data.total} 条 · 成功 ${data.ok} · 失败 ${data.failed} · 产出 ${fmtBytes(data.bytes_total)}` +
+    (rot.enabled ? ` · 轮转 当前 ${fmtBytes(rot.bytes)} / ${rot.entries} 条（阈值 ${fmtBytes(lim.bytes)} / ${lim.entries} 条 / ${lim.age_days} 天）${age}` : " · 记录已关闭");
+  const items = data.items || [];
+  if (!items.length) {
+    $("apiRecords").innerHTML = `<div class="empty">暂无 API 音频记录（记录关闭时不会有；可在启动时设 OMNI_API_RECORD=1 开启）。</div>`;
+    return;
+  }
+  $("apiRecords").innerHTML = items.map((r) => {
+    const chips = [
+      "voice=" + (r.voice || "-"),
+      "speed=" + r.speed,
+      "step=" + r.num_step,
+      r.format,
+      "cache=" + (r.cache || "-"),
+      r.elapsed_ms != null ? r.elapsed_ms + "ms" : null,
+      r.bytes ? fmtBytes(r.bytes) : null
+    ].filter(Boolean).map((c) => `<span class="chip">${esc(c)}</span>`).join("");
+    const audio = r.audio_url ? `<audio controls src="${esc(r.audio_url)}"></audio>` : "";
+    return `<div class="rec" data-id="${esc(r.id)}">
+      <div class="rec-head">
+        <span class="badge ${r.status === "ok" ? "ok" : "err"}">${esc(r.status)}</span>
+        <span class="badge src">${esc(r.voice_mode || "-")}</span>
+        <span class="badge">${esc(r.cache || "-")}</span>
+        <span class="meta">${esc(fmtTime(r.time))}</span>
+        <span class="spacer"></span>
+        <span class="meta">${esc(r.id)}</span>
+      </div>
+      <div class="text">${esc(r.text)}</div>
+      <div class="chips">${chips}</div>
+      ${r.error ? `<div class="text" style="color:var(--err)">${esc(r.error)}</div>` : ""}
+      ${audio}
+      <div class="rec-actions">
+        ${r.audio_url ? `<a href="${esc(r.audio_url)}&download=1"><button>下载音频</button></a>` : ""}
+        <button data-act="del" class="danger">删除</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+$("apiRefresh").onclick = () => { loadApiLog(); loadApiRecords(); };
+$("apiLimit").onchange = loadApiRecords;
+$("apiClear").onclick = async () => {
+  if (!confirm("清空全部 API 音频记录与产出？此操作不可撤销。")) return;
+  await api("/admin/api-records", { method: "DELETE" });
+  loadApiLog(); loadApiRecords();
+};
+$("apiRecords").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-act='del']");
+  if (!btn) return;
+  const box = btn.closest(".rec");
+  const id = box.dataset.id;
+  if (!confirm("删除这条 API 记录及其音频产出？")) return;
+  await api("/admin/api-records/" + encodeURIComponent(id), { method: "DELETE" });
+  loadApiRecords();
+});
 
 $("records").addEventListener("click", async (ev) => {
   const btn = ev.target.closest("button[data-act]");
@@ -866,9 +1082,177 @@ $("clear").onclick = async () => {
   loadHistory();
 };
 
+/* ---------- model management ---------- */
+let MODELS = [];
+
+function modelTypeLabel(t) {
+  return t === "lora" ? "LoRA 适配器" : "完整权重";
+}
+
+function renderModels(data) {
+  MODELS = data.models || [];
+  const cur = data.current || {};
+  const activeId = data.active;
+
+  // current panel
+  const bits = [];
+  bits.push('<div class="text">' + (cur.name || activeId || "未选择")
+    + (activeId ? ' <span class="tag on">当前生效</span>' : "") + "</div>");
+  bits.push('<div class="meta">id：' + (cur.id || "-")
+    + " · 类型：" + modelTypeLabel(cur.type)
+    + " · 路径：<code>" + (cur.path || "-") + "</code></div>");
+  bits.push('<div class="meta">运行时已加载：' + (data.loaded ? "是" : "否")
+    + (data.loaded_id ? "（" + data.loaded_id + "）" : "")
+    + " · 设备：" + (data.device || "-")
+    + " · dtype：" + (data.dtype || "-")
+    + " · num_step：" + (data.num_step == null ? "-" : data.num_step)
+    + " · ASR：" + (data.asr_model || "-") + "</div>");
+  $("mCurrent").innerHTML = bits.join("");
+
+  // select
+  const sel = $("mSelect");
+  const prev = sel.value;
+  sel.innerHTML = MODELS.map((m) => {
+    const mark = m.id === activeId ? " （当前）" : "";
+    return '<option value="' + m.id + '">' + m.name + " — " + m.id + mark + "</option>";
+  }).join("");
+  if (prev && MODELS.some((m) => m.id === prev)) sel.value = prev;
+  else if (activeId) sel.value = activeId;
+
+  // list
+  if (!MODELS.length) {
+    $("mList").innerHTML = '<div class="empty">尚未注册任何模型</div>';
+    return;
+  }
+  const rows = MODELS.map((m) => {
+    const tags = [];
+    if (m.id === activeId) tags.push('<span class="tag on">当前生效</span>');
+    tags.push('<span class="tag">' + modelTypeLabel(m.type) + "</span>");
+    if (m.base) tags.push('<span class="tag">基座 ' + m.base + "</span>");
+    return '<div class="rec" style="margin-bottom:8px">'
+      + '<div class="text">' + m.name + " " + tags.join("")
+      + '<div class="meta">id：<code>' + m.id + "</code> · 路径：<code>" + m.path + "</code></div>"
+      + "</div></div>";
+  });
+  $("mList").innerHTML = rows.join("");
+}
+
+async function loadModels() {
+  try {
+    const r = await api("/admin/models");
+    const data = await r.json();
+    renderModels(data);
+  } catch (e) {
+    $("mCurrent").innerHTML = '<div class="empty">无法读取模型列表</div>';
+  }
+}
+
+$("mLoad").onclick = async () => {
+  const id = $("mSelect").value;
+  if (!id) return;
+  if (!confirm("加载模型「" + id + "」？会重建模型并写入持久化配置。")) return;
+  $("mLoad").disabled = true;
+  $("mLoad").textContent = "加载中…";
+  try {
+    const r = await api("/admin/models/load", {
+      method: "POST",
+      body: JSON.stringify({ id: id }),
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      alert("加载失败：" + (d.detail || d.error || r.status));
+    } else {
+      await loadModels();
+      await loadHealth();
+    }
+  } catch (e) {
+    alert("加载失败：" + e);
+  } finally {
+    $("mLoad").disabled = false;
+    $("mLoad").textContent = "加载并设为当前";
+  }
+};
+
+$("mScan").onclick = async () => {
+  $("mScan").disabled = true;
+  try {
+    const r = await api("/admin/models/scan", { method: "POST" });
+    const d = await r.json();
+    const found = d.found || [];
+    const unreg = found.filter((x) => !x.registered);
+    $("mScanInfo").textContent = found.length
+      ? "扫描 " + (d.dirs || []).join("、") + "：共 " + found.length + " 个模型目录，其中 " + unreg.length + " 个未注册。"
+      : "扫描 " + (d.dirs || []).join("、") + "：未发现模型目录。";
+    if (unreg.length) {
+      const lines = unreg.map((x) => x.path + "  [" + x.type + "]");
+      if (confirm("发现未注册的模型目录：\n\n" + lines.join("\n")
+        + "\n\n点「确定」用第一个自动注册，其余请用下方表单。")) {
+        const x = unreg[0];
+        await registerModel(slug(x.name), x.name, x.path, x.type);
+      }
+    }
+  } catch (e) {
+    $("mScanInfo").textContent = "扫描失败：" + e;
+  } finally {
+    $("mScan").disabled = false;
+  }
+};
+
+function slug(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "model";
+}
+
+async function registerModel(id, name, path, type) {
+  const r = await api("/admin/models/register", {
+    method: "POST",
+    body: JSON.stringify({ id: id, name: name, path: path, type: type }),
+  });
+  const d = await r.json();
+  if (!r.ok) {
+    alert("注册失败：" + (d.detail || d.error || r.status));
+    return false;
+  }
+  await loadModels();
+  return true;
+}
+
+$("mRegister").onclick = async () => {
+  const id = $("mId").value.trim();
+  const name = $("mName").value.trim() || id;
+  const path = $("mPath").value.trim();
+  const type = $("mType").value;
+  if (!id || !path) {
+    alert("id 与路径为必填。");
+    return;
+  }
+  const ok = await registerModel(id, name, path, type);
+  if (ok) {
+    $("mId").value = "";
+    $("mName").value = "";
+    $("mPath").value = "";
+    $("mScanInfo").textContent = "已注册：" + id;
+  }
+};
+
+$("mDelete").onclick = async () => {
+  const id = $("mSelect").value;
+  if (!id) return;
+  if (!confirm("从注册表中删除模型「" + id + "」？（不删除磁盘文件）")) return;
+  const r = await api("/admin/models/" + encodeURIComponent(id), { method: "DELETE" });
+  const d = await r.json();
+  if (!r.ok) {
+    alert("删除失败：" + (d.detail || d.error || r.status));
+    return;
+  }
+  await loadModels();
+};
+
 loadHealth();
 loadVoices();
 loadHistory();
+loadApiLog();
+loadApiRecords();
+loadModels();
 </script>
 </body>
 </html>

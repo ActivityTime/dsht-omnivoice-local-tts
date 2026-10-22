@@ -36,6 +36,8 @@ OmniVoice（k2-fsa / 小米 Next-gen Kaldi 开源 TTS，~0.6B 参数，扩散语
 | `python/` | 内置 embeddable CPython 3.13 运行时 + 全部依赖 | ✅ 必需 | ~7 GB |
 | `history/` | 管理台请求归档（见 §3.5），运行时生成 | 产物 | 随使用增长 |
 | `voices/` | 声音克隆音色库（见 §3.7），运行时生成 | 产物 | 每音色约 7 KB + 原始音频 |
+| `model_config.json` | 模型注册表 + 当前生效模型（见 §3.9），运行时生成，不入库 | 产物 | <1 KB |
+| `finetunes/` | 外部权重目录的**目录联接**（Windows junction，可选），用于把别盘的模型挂进项目 | 可选 | 0（不复制数据） |
 | `download_model.py` | 从 hf-mirror 拉取模型权重的脚本 | 可选 | <1 KB |
 | `server.log` | 运行日志（启动后生成） | 产物 | 随运行增长 |
 | `test_out.mp3` / `test_out2.mp3` | 验证用生成产物 | 产物 | ~50/28 KB |
@@ -86,7 +88,7 @@ python\python.exe server.py > server.log 2>&1
 | `OMNIVOICE_POSITION_TEMPERATURE` | `5.0` | 生成默认：位置选择温度（0.01–50） |
 | `OMNIVOICE_CLASS_TEMPERATURE` | `0.0` | 生成默认：token 采样温度（0–10，0=贪心确定性） |
 | `OMNIVOICE_DENOISE` | `1` | 生成默认：是否加 `<|denoise|>` 令牌 |
-| `OMNIVOICE_POSTPROCESS_OUTPUT` | `1` | 生成默认：后处理（剪 >0.5s 句中静音 / 淡入淡出 / 边距静音） |
+| `OMNIVOICE_POSTPROCESS_OUTPUT` | `0` | 生成默认：后处理（剪 >0.5s 句中静音 / 淡入淡出 / 边距静音）；默认关闭，设 `1` 强制开启 |
 | `OMNIVOICE_PAD_DURATION` | `0.1` | 生成默认：边距静音秒数（0–2，0=不加） |
 | `OMNIVOICE_FADE_DURATION` | `0.1` | 生成默认：淡入淡出秒数（0–2，0=不淡入淡出） |
 | `OMNIVOICE_AUDIO_CHUNK_DURATION` | `15` | 生成默认：长文本分块时长（秒，1–60，块间交叉淡化） |
@@ -98,9 +100,28 @@ python\python.exe server.py > server.log 2>&1
 | `OMNI_TTS_USE_INSTRUCTIONS` | `0` | 管理台「附加属性」开关的默认值 |
 | `OMNI_TTS_HISTORY_DIR` | `history/` | 管理台请求归档目录 |
 | `OMNI_TTS_CLONE_DIR` | `voices/` | 声音克隆音色库目录 |
-| `OMNI_TTS_LOG_API` | `0` | 是否也归档 OpenAI 端点（`/v1/audio/speech`）的请求；DSHT 逐条调用会持续写盘，默认关 |
+| `OMNI_TTS_LOG_API` | `1` | 兼容开关：`0` 可关闭 OpenAI 端点（`/v1/audio/speech`）归档（即使 `OMNI_API_RECORD=1`）；DSHT 逐条调用也不再写盘 |
+| `OMNI_API_RECORD` | `1` | 是否归档 OpenAI 端点请求（含失败与**缓存命中**），落 `records/` 并按三阈值轮转 |
+| `OMNI_TTS_RECORD_DIR` | `records/` | OpenAI 端点记录归档目录 |
+| `OMNI_RECORD_MAX_ENTRIES` | `500` | 记录轮转：最多保留条数（≤0 不限） |
+| `OMNI_RECORD_MAX_MB` | `2048` | 记录轮转：最大体积 MB（≤0 不限） |
+| `OMNI_RECORD_MAX_AGE_DAYS` | `30` | 记录轮转：超龄天数即删（≤0 不限） |
+| `OMNI_CACHE` | `1` | 响应缓存：同参数请求直接返回已生成音频（见下） |
+| `OMNI_TTS_CACHE_DIR` | `cache/` | 响应缓存目录（按 key 分桶） |
+| `OMNI_CACHE_MAX_ENTRIES` | `2000` | 缓存轮转：最多条数 |
+| `OMNI_CACHE_MAX_MB` | `2048` | 缓存轮转：最大体积 MB |
+| `OMNI_CACHE_MAX_AGE_DAYS` | `30` | 缓存轮转：超龄天数 |
+| `OMNI_API_LOG_MAX` | `300` | 管理台「请求日志」环形缓冲条数（内存，不落盘） |
+| `OMNI_HISTORY_MAX_ENTRIES` | `500` | 管理台历史归档轮转：最多条数 |
+| `OMNI_HISTORY_MAX_MB` | `2048` | 管理台历史归档轮转：最大体积 MB |
+| `OMNI_HISTORY_MAX_AGE_DAYS` | `30` | 管理台历史归档轮转：超龄天数 |
+| `OMNI_LOG_FILE` | `server.log` | 运行日志文件（由 `RotatingFileHandler` 托管，按大小轮转） |
+| `OMNI_LOG_MAX_MB` | `10` | 运行日志轮转：单文件最大 MB |
+| `OMNI_LOG_BACKUPS` | `5` | 运行日志轮转：保留备份数 |
 | `OMNI_TTS_ADMIN_PAGE` | `admin.html` | 管理台页面文件位置 |
 | `OMNI_TTS_TRAY` | `1` | 是否显示系统托盘图标（仅 Windows 有效）；`0` 关闭 |
+| `OMNI_MODEL_CONFIG` | `model_config.json` | 模型注册表文件位置（运行时状态，不入库） |
+| `OMNI_TTS_MODEL_DIRS` | 空 | 追加的模型扫描目录（`os.pathsep` 分隔，如 `D:\models;E:\weights`） |
 
 ### 3.4 健康检查
 ```bat
@@ -129,6 +150,12 @@ curl http://127.0.0.1:8890/health
    - `audio.mp3` / `audio.wav`：实际音频产出。
 4. **回看与复用** —— 列表内直接试听、下载、把历史参数一键回填表单重跑、单条删除或清空全部；顶部显示
    总条数/成功/失败/累计产出体积。
+5. **API 记录子页面** —— 控制台底部「API 记录」区块分三块：①「请求日志」表（时间 / 状态 / 缓存命中 / 音色 / 模式 / 格式 / 耗时 / 字节 / 文本，环形缓冲最近 300 条）；②「音频记录与轮转」列表（与 history 同款可试听 / 下载 / 删除，并显示当前用量 vs 三阈值）；③ 顶部统计当前缓存命中 / 未命中 / 写入数与磁盘占用。DSHT 每次调用都会在此留档（默认开启，关闭见 `OMNI_API_RECORD` / `OMNI_TTS_LOG_API`）。
+6. **响应缓存** —— 相同参数（`text` + `voice` + `instruct` + `format` + 全部生成参数；克隆音色还含其 `.pt` 文件签名）的请求直接返回已生成音频，响应头 `X-Cache: hit`，跳过模型推理（实测加速数百倍）。缓存落 `cache/` 并按三阈值轮转；**命中条目仍会写入 API 记录**以保持审计完整。
+7. **模型管理面板** —— 顶部导航「模型管理」：显示当前生效模型（名称/类型/路径/设备/dtype/ASR）、
+   已注册模型下拉选择、「加载并设为当前」「扫描目录」「删除所选」，
+   以及手工注册新模型（id / 名称 / 路径 / 类型 checkpoint|lora）。切换即时生效并写入
+   `model_config.json`，**重启后自动恢复**。详见 §3.9。
 
 **属性填写规则（模型侧强校验，踩过坑）**
 
@@ -147,7 +174,18 @@ curl http://127.0.0.1:8890/health
 | DELETE | `/admin/history/{id}` | 删除单条（含音频） |
 | DELETE | `/admin/history` | 清空全部归档 |
 | GET | `/admin/audio/{id}?download=1` | 回放 / 下载产出音频 |
+| GET | `/admin/api-records?limit=50` | OpenAI 端点音频记录列表 + 轮转统计（含播放 / 下载） |
+| GET | `/admin/api-records/{id}` | 单条详情 |
+| DELETE | `/admin/api-records/{id}` | 删除单条（含音频） |
+| DELETE | `/admin/api-records` | 清空全部端点记录 |
+| GET | `/admin/api-audio/{id}?ext=mp3&download=1` | 回放 / 下载端点产出音频 |
+| GET | `/admin/api-log?limit=100` | 最近请求日志（环形缓冲，含缓存命中 / 失败、缓存磁盘统计） |
 | GET | `/admin/languages` | 模型 646 种语言表（`ids` + `names`），供 `language` 自动补全 |
+| GET | `/admin/models` | 模型注册表 + 当前生效模型 + 扫描目录（§3.9） |
+| POST | `/admin/models/load` | 运行时切换模型并持久化（§3.9） |
+| POST | `/admin/models/register` | 注册新模型（§3.9） |
+| DELETE | `/admin/models/{id}` | 从注册表移除模型（§3.9） |
+| POST | `/admin/models/scan` | 扫描可加载的模型目录（§3.9） |
 
 ---
 
@@ -257,7 +295,7 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 | `position_temperature` | num | `5.0` | 0.01–50 | 保持默认 | 位置选择温度 |
 | `class_temperature` | num | `0.0` | 0–10 | 0 | token 采样温度（0=贪心确定性）；想多样可试 0.3–0.8，可能读错字 |
 | `denoise` | bool | `true` | — | 保持开启 | 是否加 `<|denoise|>` 令牌 |
-| `postprocess_output` | bool | `true` | — | 保持开启 | 剪 >0.5s 句中静音 / 淡入淡出 / 边距静音 |
+| `postprocess_output` | bool | `false` | — | 默认关闭；`OMNIVOICE_POSTPROCESS_OUTPUT=1` 强制开启 | 剪 >0.5s 句中静音 / 淡入淡出 / 边距静音 |
 | `pad_duration` | num | `0.1` | 0–2 | 0.05–0.2 | 输出两端静音秒数；0=不加，句首辅音可能被切 |
 | `fade_duration` | num | `0.1` | 0–2 | 0.05–0.2 | 头尾淡入淡出秒数，防爆音 |
 | `audio_chunk_duration` | num | `15` | 1–60 | 10–20 | 长文本分块时长（秒），块间交叉淡化 |
@@ -285,6 +323,67 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 - 中文标点走 byte-level fallback（模型侧保留），ASCII 标点有专属 token；标点影响时长估计（权重 0.5）。
 - 支持 14 个非语言标签（`[laughter]` 等）与大写拼音+声调数字的发音控制语法（`[B EY1 S]`）。
 - 预估 >30s 的长文本按标点分块（缩写感知），约 15s/块交叉淡化拼接。
+
+### 3.9 模型管理（运行时切换 · 持久化生效）
+
+服务可加载**多个模型**并在运行时热切换，切换结果写入 `model_config.json`，
+**重启后自动恢复**上次的选择。管理台「模型管理」面板或下面的 API 都能操作。
+
+**支持的模型类型**
+
+| type | 含义 | 加载方式 |
+|---|---|---|
+| `checkpoint` | 完整权重（官方基座 / 全参微调） | 直接 `from_pretrained(path)` |
+| `lora` | PEFT 适配器 | 先加载其 `base` 指定的基座，再把 LoRA 增量**手动合并**进 `model.llm` |
+
+> **为什么 LoRA 走手动合并而不是 PEFT 自动合并**：PEFT 的 `PeftModel.from_pretrained()`
+> 会把 Windows 盘符路径当成 HF repo id 校验而拒绝；且 OmniVoice 的 `model.llm` 是裸
+> `Qwen3Model`（无 generation mixin），PEFT 初始化时取 `prepare_inputs_for_generation`
+> 直接 AttributeError。手动合并直接读 `lora_A`/`lora_B`，按 `adapter_config.json` 的
+> `r`/`lora_alpha`/`use_rslora` 算缩放（RSLoRA 为 `α/√r`）后累加进基座权重。
+
+**模型注册表 `model_config.json`**
+
+- 位于项目根目录，**已加入 `.gitignore`**（本机运行时状态，不入库）。
+- 路径以**相对项目根**存储（如 `models/OmniVoice`、`finetunes/xxx`），整体搬走项目仍可用。
+- `active` 字段即当前生效的模型；`/health` 会回报 `model` / `model_name` / `model_type` /
+  `loaded_id`。
+- 删掉该文件即回到默认（只注册官方基座 `base`）。
+
+**扫描目录**（管理台「扫描目录」按钮 / `POST /admin/models/scan`）
+
+按运行时装配位置推导，**不含任何写死的盘符**：
+
+1. `<项目根>/models`、`<项目根>/finetunes`
+2. 项目根**同级**目录中名字含 `finetune` / `model` 的目录
+3. 环境变量 `OMNI_TTS_MODEL_DIRS`（`os.pathsep` 分隔）追加的任意目录
+
+把外部权重目录接进项目的方式（Windows 目录联接，不复制数据）：
+
+```powershell
+New-Item -ItemType Junction -Path "<项目根>\finetunes" -Target "<权重盘>:\OmniVoice_finetunes"
+```
+
+扫描会按目录内容自动判定类型：有 `adapter_config.json` → `lora`；
+`config.json` 的 `architectures` 含 `OmniVoice` → `checkpoint`。
+
+**API**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/admin/models` | 列出注册表、当前生效模型、设备/dtype/ASR、扫描目录 |
+| POST | `/admin/models/load` | `{"id":"..."}`：运行时切换（重建模型，约数十秒）并持久化 |
+| POST | `/admin/models/register` | `{"id","name","path","type","base"}`：`type` ∈ `checkpoint`/`lora`；`base` 省略时取第一个 checkpoint |
+| DELETE | `/admin/models/{id}` | 从注册表移除（**不删磁盘文件**）；`base` 与当前生效模型受保护 |
+| POST | `/admin/models/scan` | 扫描可加载目录，返回每个目录的 `type` 与是否已注册 |
+
+**切换语义**
+
+- 新模型在**锁外**加载（重 I/O + 显存），完成后在锁内**原子替换**；旧模型在替换后才释放，
+  因此在途请求不会撞到 `None`。
+- 切换失败（如路径错误、显存不足）**保留原模型继续服务**，并返回 500 + 原因。
+- 释放旧模型后会 `gc.collect()` + `torch.cuda.empty_cache()` 归还显存。
+- 切换需要重建整个模型（约 1–2 分钟，取决于权重），期间新合成请求会等待。
 
 ## 4. DSHT 配音接入配置
 

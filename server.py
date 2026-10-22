@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import io
 import json
 import logging
@@ -32,7 +33,9 @@ import threading
 import time
 import uuid
 import webbrowser
+from collections import deque
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +89,41 @@ import uvicorn  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("omnivoice-openai")
 
+# --- log rotation --------------------------------------------------------------
+# server.log used to depend on a shell redirect (>> server.log 2>&1): it grew
+# without bound and vanished entirely when the server was started any other way
+# (start.cmd, double click). The file is now owned by a RotatingFileHandler, so
+# every launch path writes to it and rotation is enforced by size.
+LOG_FILE = Path(os.environ.get("OMNI_LOG_FILE", HERE / "server.log"))
+LOG_MAX_BYTES = int(float(os.environ.get("OMNI_LOG_MAX_MB", "10")) * 1024 * 1024)
+LOG_BACKUPS = int(os.environ.get("OMNI_LOG_BACKUPS", "5"))
+
+
+def setup_logging() -> None:
+    """Install console + size-rotated file logging on the root logger.
+
+    Called from main() right before uvicorn.run(..., log_config=None): with
+    uvicorn's own logging config skipped, its "uvicorn"/"uvicorn.access"
+    records propagate to the root logger configured here, so the access log
+    (method/path/status per request) lands in the rotating file as well.
+    """
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root.addHandler(console)
+    try:
+        rotating = RotatingFileHandler(
+            LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8"
+        )
+        rotating.setFormatter(formatter)
+        root.addHandler(rotating)
+    except OSError as error:
+        sys.stderr.write(f"[logging] file handler disabled ({LOG_FILE}): {error}\n")
+
 # Default to the locally-snapshotted copy (downloaded by download_model.py) so we
 # never depend on the HF Xet/CAS backend at inference time. Override with the
 # OMNIVOICE_MODEL env var if you ever want to pull from the hub again.
@@ -115,6 +153,11 @@ USE_INSTRUCTIONS = os.environ.get("OMNI_TTS_USE_INSTRUCTIONS", "0") == "1"
 # holding meta.json plus the decoded audio, so runs can be replayed later.
 HISTORY_DIR = Path(os.environ.get("OMNI_TTS_HISTORY_DIR", HERE / "history"))
 ADMIN_FILE = Path(os.environ.get("OMNI_TTS_ADMIN_PAGE", HERE / "admin.html"))
+# Rotation for the admin-console archive, same three-threshold scheme as the
+# API records below. Disabled per axis when the limit is <= 0.
+HISTORY_MAX_ENTRIES = int(os.environ.get("OMNI_HISTORY_MAX_ENTRIES", "500"))
+HISTORY_MAX_BYTES = int(float(os.environ.get("OMNI_HISTORY_MAX_MB", "2048")) * 1024 * 1024)
+HISTORY_MAX_AGE_DAYS = float(os.environ.get("OMNI_HISTORY_MAX_AGE_DAYS", "30"))
 
 # --- cloned voices (voice clone prompts) ------------------------------------
 # create_voice_clone_prompt() is expensive, so its result is written to disk
@@ -127,10 +170,68 @@ _AUDIO_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac")
 # Rejects path separators and Windows-reserved characters.
 _NAME_RE = re.compile(r"^[^\\/:*?\"<>|\r\n\t]{1,64}$")
 _clone_cache: dict[str, Any] = {}
-# Requests arriving on the OpenAI endpoint are only logged when enabled: DSH
-# Tavern can fire one per message bubble and would fill the disk.
-LOG_API = os.environ.get("OMNI_TTS_LOG_API", "0") == "1"
+# OpenAI-endpoint traffic is archived by default. This supersedes the old
+# OMNI_TTS_LOG_API=0 default-off behaviour: rotation (below) bounds the disk
+# usage, so the "DSH Tavern fires one request per chat bubble" worry is gone.
+# Set OMNI_API_RECORD=0 (or the legacy OMNI_TTS_LOG_API=0) to switch it off.
+API_RECORD = (
+    os.environ.get("OMNI_API_RECORD", "1") == "1"
+    and os.environ.get("OMNI_TTS_LOG_API", "1") == "1"
+)
+RECORD_DIR = Path(os.environ.get("OMNI_TTS_RECORD_DIR", HERE / "records"))
+# Rotation for the endpoint archive: oldest entries are pruned once any limit
+# trips. A limit <= 0 disables that particular axis.
+RECORD_MAX_ENTRIES = int(os.environ.get("OMNI_RECORD_MAX_ENTRIES", "500"))
+RECORD_MAX_BYTES = int(float(os.environ.get("OMNI_RECORD_MAX_MB", "2048")) * 1024 * 1024)
+RECORD_MAX_AGE_DAYS = float(os.environ.get("OMNI_RECORD_MAX_AGE_DAYS", "30"))
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# --- response cache ------------------------------------------------------------
+# Requests whose audio-affecting surface is byte-identical (text + voice +
+# format + the fully resolved generation config) are served from disk without
+# touching the model: DSH Tavern re-sends the same bubble on re-renders, and
+# the console re-runs while tuning knobs. Cached audio is copied into the
+# record archive on a hit, so the audit trail stays complete.
+CACHE_DIR = Path(os.environ.get("OMNI_TTS_CACHE_DIR", HERE / "cache"))
+CACHE_ENABLED = os.environ.get("OMNI_CACHE", "1") == "1"
+CACHE_MAX_ENTRIES = int(os.environ.get("OMNI_CACHE_MAX_ENTRIES", "2000"))
+CACHE_MAX_BYTES = int(float(os.environ.get("OMNI_CACHE_MAX_MB", "2048")) * 1024 * 1024)
+CACHE_MAX_AGE_DAYS = float(os.environ.get("OMNI_CACHE_MAX_AGE_DAYS", "30"))
+
+
+def _model_scan_roots() -> list[Path]:
+    """Directories that may hold loadable model folders.
+
+    Derived at runtime from the install location — never a literal drive
+    letter — so the project stays portable across machines. Override with
+    OMNI_TTS_MODEL_DIRS (os.pathsep-separated) to add your own roots.
+    """
+    roots: list[Path] = [HERE / "models", HERE / "finetunes"]
+    # sibling directories of the install dir that look like model collections
+    try:
+        for sib in sorted(HERE.parent.iterdir()):
+            if sib.is_dir() and ("finetune" in sib.name.lower() or "model" in sib.name.lower()):
+                roots.append(sib)
+    except OSError:
+        pass
+    for extra in os.environ.get("OMNI_TTS_MODEL_DIRS", "").split(os.pathsep):
+        extra = extra.strip()
+        if extra:
+            roots.append(Path(extra))
+    seen: set[str] = set()
+    out: list[Path] = []
+    for r in roots:
+        key = str(r)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+# In-memory ring of the most recent endpoint requests (failures and cache hits
+# included). RAM only — a live view for the console, not an audit trail.
+API_LOG_MAX = int(os.environ.get("OMNI_API_LOG_MAX", "300"))
+_api_log_ring: deque[dict[str, Any]] = deque(maxlen=max(1, API_LOG_MAX))
+_cache_stats: dict[str, int] = {"hits": 0, "misses": 0, "puts": 0, "pruned": 0}
 
 SAMPLE_RATE = 24000
 MAX_TEXT = 4000
@@ -147,7 +248,7 @@ GEN_DEFAULTS: dict[str, Any] = {
     "position_temperature": float(os.environ.get("OMNIVOICE_POSITION_TEMPERATURE", "5.0")),
     "class_temperature": float(os.environ.get("OMNIVOICE_CLASS_TEMPERATURE", "0.0")),
     "denoise": os.environ.get("OMNIVOICE_DENOISE", "1") == "1",
-    "postprocess_output": os.environ.get("OMNIVOICE_POSTPROCESS_OUTPUT", "1") == "1",
+    "postprocess_output": os.environ.get("OMNIVOICE_POSTPROCESS_OUTPUT", "0") == "1",
     "pad_duration": float(os.environ.get("OMNIVOICE_PAD_DURATION", "0.1")),
     "fade_duration": float(os.environ.get("OMNIVOICE_FADE_DURATION", "0.1")),
     "audio_chunk_duration": float(os.environ.get("OMNIVOICE_AUDIO_CHUNK_DURATION", "15.0")),
@@ -330,7 +431,280 @@ DEFAULT_VOICES: dict[str, str] = {
     "verse": "male, middle-aged, moderate pitch",
 }
 
-_state: dict[str, Any] = {"model": None, "lock": threading.Lock()}
+_state: dict[str, Any] = {"model": None, "lock": threading.Lock(), "model_id": None}
+
+
+# --- model registry + persistent selection ----------------------------------
+# Models (base checkpoints, full finetunes, or LoRA adapters) are registered in
+# model_config.json. The `active` entry is loaded at startup and can be swapped
+# at runtime from the admin console; the choice is persisted so it survives
+# restarts. A "lora" entry is loaded by instantiating its `base` checkpoint and
+# then merging the adapter weights into model.llm in-place (PEFT's auto-merge is
+# skipped — it rejects Windows paths and OmniVoice's bare Qwen3Model lacks the
+# generation mixin; the manual merge is the path proven in scratch/test_lora_zh.py).
+
+CONFIG_PATH = Path(os.environ.get("OMNI_MODEL_CONFIG", HERE / "model_config.json"))
+
+
+def _store_path(path: Path) -> str:
+    """Serialise a model path for the registry, relative to the install root.
+
+    Keeps model_config.json portable: anything under the project directory is
+    stored as a relative path, so the registry survives moving the whole
+    install. Paths outside it (e.g. a weights dir on another volume) stay
+    absolute because there is nothing to be relative to.
+
+    Note: `absolute()` is used rather than `resolve()` on purpose — resolve()
+    follows directory junctions, which would turn a project-local junction
+    (e.g. finetunes/ -> another volume) back into an absolute foreign path and
+    defeat the relativisation.
+    """
+    p = Path(os.path.abspath(path))
+    try:
+        return str(p.relative_to(HERE))
+    except Exception:  # noqa: BLE001
+        return str(p)
+
+
+def _resolve_model_ref(ref: str | None) -> str:
+    """Resolve a stored model reference to something the library accepts.
+
+    A reference may be a local directory (absolute, or relative to the install
+    root) or a Hugging Face repo id ("org/name"). A repo id must be passed
+    through untouched, so the two are told apart by shape:
+      - absolute path  -> path
+      - relative path that exists under the install root -> path
+      - anything else containing a separator -> repo id (org/name)
+      - plain name -> repo id
+    """
+    raw = str(ref or "").strip()
+    if not raw:
+        return str(HERE / "models" / "whisper-large-v3-turbo")
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    p = Path(expanded)
+    if p.is_absolute():
+        return str(p)
+    if not os.sep in raw and "/" not in raw:
+        return raw  # plain name -> repo id
+    candidate = HERE / p
+    if candidate.exists():
+        return str(candidate)
+    return raw  # "org/name" style -> repo id
+
+
+def _default_registry() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "base",
+            "name": "OmniVoice 官方基座",
+            "path": "models/OmniVoice",  # relative to the install root
+            "type": "checkpoint",
+        }
+    ]
+
+
+def load_config() -> dict[str, Any]:
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("models"):
+                data.setdefault("active", data["models"][0]["id"])
+                data.setdefault("device", DEVICE)
+                data.setdefault("dtype", DTYPE_NAME)
+                data.setdefault("num_step", NUM_STEP)
+                data.setdefault("asr_model", _store_path(Path(ASR_MODEL_ID)))
+                data.setdefault("asr_device", ASR_DEVICE)
+                return data
+        except Exception as error:  # noqa: BLE001
+            log.warning("model_config.json 不可读 (%s)，回退默认", error)
+    cfg = {
+        "active": "base",
+        "device": DEVICE,
+        "dtype": DTYPE_NAME,
+        "num_step": NUM_STEP,
+        "asr_model": _store_path(Path(ASR_MODEL_ID)),
+        "asr_device": ASR_DEVICE,
+        "models": _default_registry(),
+    }
+    save_config(cfg)
+    return cfg
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, CONFIG_PATH)
+    except OSError as error:
+        log.warning("保存 model_config.json 失败: %s", error)
+
+
+MODEL_CONFIG = load_config()
+
+
+def _find_model(cfg: dict[str, Any], model_id: str) -> dict[str, Any] | None:
+    for entry in cfg.get("models", []):
+        if entry.get("id") == model_id:
+            return entry
+    return None
+
+
+def _first_checkpoint_id(cfg: dict[str, Any]) -> str | None:
+    for entry in cfg.get("models", []):
+        if entry.get("type") != "lora":
+            return entry["id"]
+    return cfg.get("models", [{}])[0].get("id")
+
+
+def _instantiate(path: str, device: str, dtype, asr_model: str, asr_device: str | None):
+    import torch
+    from omnivoice import OmniVoice
+
+    # set_num_interop_threads may only be called once per process, before any
+    # parallel work has started. A runtime model swap calls this again, so the
+    # second call raises and aborts the load — hence the one-shot guard.
+    torch.set_num_threads(1)
+    if not _state.get("interop_set"):
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        _state["interop_set"] = True
+    extra = {"asr_model_name": asr_model}
+    if asr_device:
+        extra["asr_device"] = asr_device
+    return OmniVoice.from_pretrained(
+        path, device_map=device, dtype=dtype, low_cpu_mem_usage=True, **extra
+    )
+
+
+def _merge_lora(model, lora_dir: str) -> None:
+    """Manually merge a PEFT LoRA into `model.llm` weights in-place.
+
+    PEFT's `PeftModel.from_pretrained(...).merge_and_unload()` is skipped: it
+    treats a Windows drive-letter path as an HF repo id (validate_repo_id
+    rejects it), and OmniVoice's `model.llm` is a bare Qwen3Model with no
+    generation mixin, so PEFT init also fails with AttributeError. Instead we
+    read lora_A/lora_B straight from the safetensors and add the delta in-place.
+    r/alpha/use_rslora come from adapter_config.json so the scaling is exact.
+    """
+    import torch  # noqa: F401
+    import safetensors.torch as st  # type: ignore
+
+    cfg_path = Path(lora_dir) / "adapter_config.json"
+    r, alpha, rslora = 16, 32, False
+    if cfg_path.exists():
+        try:
+            ac = json.loads(cfg_path.read_text(encoding="utf-8"))
+            r = int(ac.get("r", r))
+            alpha = int(ac.get("lora_alpha", alpha))
+            rslora = bool(ac.get("use_rslora", rslora))
+        except Exception:  # noqa: BLE001
+            pass
+    scaling = (alpha / r) if not rslora else (alpha / (r ** 0.5))
+
+    st_path = None
+    for cand in ("model.safetensors", "adapter_model.safetensors"):
+        p = Path(lora_dir) / cand
+        if p.exists():
+            st_path = p
+            break
+    if st_path is None:
+        raise RuntimeError(f"LoRA 权重未找到：{lora_dir}")
+    tensors = st.load_file(str(st_path))
+    device = next(model.llm.parameters()).device
+    count = 0
+    with torch.no_grad():
+        for key in list(tensors.keys()):
+            if not key.endswith("lora_A.default.weight"):
+                continue
+            prefix = key[: -len("lora_A.default.weight")]
+            bkey = prefix + "lora_B.default.weight"
+            if bkey not in tensors:
+                continue
+            A = tensors[key].float()
+            B = tensors[bkey].float()
+            delta = (B @ A) * scaling
+            modpath = prefix
+            if modpath.startswith("llm."):
+                modpath = modpath[len("llm."):]
+            # the captured prefix still carries the trailing "." that separated
+            # it from "lora_A.default.weight" — drop it before resolving.
+            modpath = modpath.rstrip(".")
+            # PEFT saves adapter keys as "<lora_root>.base_model.model.<module>".
+            # OmniVoice's model.llm is a bare Qwen3Model, whose direct children
+            # are e.g. "layers.0.mlp.down_proj" — so the whole
+            # "base_model.model." hop has to go, not just "base_model.".
+            for hop in ("base_model.model.", "base_model.", "model."):
+                if modpath.startswith(hop):
+                    modpath = modpath[len(hop):]
+                    break
+            mod = model.llm.get_submodule(modpath)
+            mod.weight.data += delta.to(mod.weight.device, mod.weight.dtype)
+            count += 1
+    log.info("merged %d LoRA modules (scaling=%.4f) from %s", count, scaling, lora_dir)
+
+
+def _load_entry(entry: dict[str, Any], cfg: dict[str, Any]):
+    if entry.get("type") == "lora":
+        base_id = entry.get("base") or _first_checkpoint_id(cfg)
+        base_entry = _find_model(cfg, base_id) or _default_registry()[0]
+        model = _instantiate(
+            str(_entry_path(base_entry)), cfg["device"], resolve_dtype(),
+            _resolve_model_ref(cfg.get("asr_model")), cfg["asr_device"],
+        )
+        _merge_lora(model, str(_entry_path(entry)))
+        return model
+    return _instantiate(
+        str(_entry_path(entry)), cfg["device"], resolve_dtype(),
+        _resolve_model_ref(cfg.get("asr_model")), cfg["asr_device"],
+    )
+
+
+def reload_model(model_id: str) -> dict[str, Any]:
+    """Swap the live model to `model_id` and persist it as active.
+
+    The new model is materialised outside the lock (heavy I/O + GPU), then
+    swapped atomically under the lock; the previous model is released only after
+    the swap so in-flight requests never see a None. Returns a status dict.
+    """
+    cfg = MODEL_CONFIG
+    entry = _find_model(cfg, model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"未找到模型「{model_id}」")
+    new_model = _load_entry(entry, cfg)  # heavy, no lock held
+    old = None
+    with _state["lock"]:
+        old = _state["model"]
+        _state["model"] = new_model
+        _state["model_id"] = model_id
+        cfg["active"] = model_id
+    if old is not None and old is not new_model:
+        try:
+            del old
+        except Exception:  # noqa: BLE001
+            pass
+        import gc  # noqa: E402
+
+        gc.collect()
+        try:
+            import torch  # noqa: F401
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+    save_config(cfg)
+    return {
+        "ok": True,
+        "active": model_id,
+        "model": {
+            "id": entry["id"],
+            "name": entry.get("name"),
+            "type": entry.get("type"),
+            "path": entry.get("path"),
+        },
+    }
 
 
 def load_voices() -> dict[str, str]:
@@ -361,33 +735,35 @@ def resolve_dtype():
 
 
 def get_model():
-    """Load the model once, at startup, so no request pays the load cost."""
+    """Load the active model once (at startup or first request), per config.
+
+    Tries the configured `active` entry first; on failure (e.g. a misconfigured
+    path) it falls back to the local base checkpoint so the service still boots.
+    """
     if _state["model"] is not None:
         return _state["model"]
     with _state["lock"]:
         if _state["model"] is not None:
             return _state["model"]
-        import torch
-        from omnivoice import OmniVoice
-
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
-        log.info("loading %s on %s as %s", MODEL_ID, DEVICE, DTYPE_NAME)
-        extra = {"asr_model_name": ASR_MODEL_ID}
-        if ASR_DEVICE:
-            extra["asr_device"] = ASR_DEVICE
-        model = OmniVoice.from_pretrained(
-            MODEL_ID,
-            device_map=DEVICE,
-            dtype=resolve_dtype(),
-            low_cpu_mem_usage=True,
-            **extra,
-        )
-        if torch.cuda.is_available():
-            log.info("CUDA ready: %s", torch.cuda.get_device_name(0))
-        _state["model"] = model
-        log.info("model ready")
-        return model
+        cfg = MODEL_CONFIG
+        try:
+            entry = _find_model(cfg, cfg["active"]) or _default_registry()[0]
+            model = _load_entry(entry, cfg)
+            _state["model"] = model
+            _state["model_id"] = entry["id"]
+            log.info("model ready: %s (%s)", entry["id"], entry.get("name"))
+        except Exception as error:  # noqa: BLE001
+            log.error("active model load failed (%s); falling back to base checkpoint", error)
+            model = _instantiate(
+                str(HERE / "models" / "OmniVoice"),
+                cfg["device"],
+                resolve_dtype(),
+                _resolve_model_ref(cfg.get("asr_model")),
+                cfg["asr_device"],
+            )
+            _state["model"] = model
+            _state["model_id"] = "base"
+        return _state["model"]
 
 
 def to_mp3(samples: np.ndarray, bit_rate: int = 64) -> bytes:
@@ -548,10 +924,14 @@ def run_generate(
     return bytes(encoder(np.asarray(samples, dtype=np.float32))), media_type
 
 
-def _history_dir(rid: str) -> Path:
+def _record_dir(root: Path, rid: str) -> Path:
     if not _ID_RE.match(rid or ""):
         raise HTTPException(status_code=400, detail="bad record id")
-    return HISTORY_DIR / rid
+    return root / rid
+
+
+def _history_dir(rid: str) -> Path:
+    return _record_dir(HISTORY_DIR, rid)
 
 
 def _read_meta(directory: Path) -> dict[str, Any] | None:
@@ -566,12 +946,12 @@ def _read_meta(directory: Path) -> dict[str, Any] | None:
     return rec
 
 
-def _all_records() -> list[dict[str, Any]]:
+def _all_records(root: Path = HISTORY_DIR, url_prefix: str = "/admin/audio") -> list[dict[str, Any]]:
     """Every stored record, newest first (by directory mtime)."""
-    if not HISTORY_DIR.exists():
+    if not root.exists():
         return []
     stamped: list[tuple[float, dict[str, Any]]] = []
-    for directory in HISTORY_DIR.iterdir():
+    for directory in root.iterdir():
         if not directory.is_dir():
             continue
         rec = _read_meta(directory)
@@ -579,21 +959,28 @@ def _all_records() -> list[dict[str, Any]]:
             continue
         if rec.get("audio_file") and (directory / rec["audio_file"]).exists():
             ext = Path(rec["audio_file"]).suffix.lstrip(".") or "mp3"
-            rec["audio_url"] = f"/admin/audio/{rec['id']}?ext={ext}"
+            rec["audio_url"] = f"{url_prefix}/{rec['id']}?ext={ext}"
         stamped.append((directory.stat().st_mtime, rec))
     stamped.sort(key=lambda pair: pair[0], reverse=True)
     return [rec for _, rec in stamped]
 
 
-def save_record(fields: dict[str, Any], payload: bytes | None, ext: str) -> dict[str, Any]:
-    """Persist one request + its audio output under history/<id>/."""
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+def save_record(
+    fields: dict[str, Any],
+    payload: bytes | None,
+    ext: str,
+    *,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Persist one request + its audio output under `<root>/<id>/`."""
+    target = root or HISTORY_DIR
+    target.mkdir(parents=True, exist_ok=True)
     rid = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     entry = dict(fields)
     entry["id"] = rid
     entry["time"] = datetime.now().isoformat(timespec="seconds")
     entry["status"] = "ok" if payload else "error"
-    directory = HISTORY_DIR / rid
+    directory = target / rid
     directory.mkdir(parents=True, exist_ok=True)
     if payload:
         (directory / f"audio.{ext}").write_bytes(payload)
@@ -602,7 +989,260 @@ def save_record(fields: dict[str, Any], payload: bytes | None, ext: str) -> dict
     (directory / "meta.json").write_text(
         json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    # The admin-console archive rotates on the same scheme as the API records.
+    # (API records are pruned inside save_api_record instead, to avoid double
+    # work — both paths stay within their own limits.)
+    if target == HISTORY_DIR:
+        prune_directory(
+            HISTORY_DIR,
+            max_entries=HISTORY_MAX_ENTRIES,
+            max_bytes=HISTORY_MAX_BYTES,
+            max_age_days=HISTORY_MAX_AGE_DAYS,
+        )
     return entry
+
+
+def prune_directory(
+    root: Path,
+    *,
+    max_entries: int,
+    max_bytes: int,
+    max_age_days: float,
+) -> dict[str, Any]:
+    """Prune `<root>/<id>/` entries beyond the limits; return a stats snapshot.
+
+    Age-based pruning is unconditional (every entry older than the limit goes),
+    then count/size are enforced oldest-first. A limit <= 0 disables that axis,
+    which makes this doubles as a disk-usage stats call. Never raises: rotation
+    is housekeeping, not a request-path dependency.
+    """
+    stats: dict[str, Any] = {"entries": 0, "bytes": 0, "pruned": 0, "oldest_age_days": None}
+    if not root.exists():
+        return stats
+    try:
+        entries: list[tuple[float, int, Path]] = []
+        for directory in root.iterdir():
+            if not directory.is_dir():
+                continue
+            try:
+                size = sum(p.stat().st_size for p in directory.rglob("*") if p.is_file())
+                entries.append((directory.stat().st_mtime, size, directory))
+            except OSError:
+                continue
+    except OSError:
+        return stats
+    entries.sort()  # oldest first
+    now = time.time()
+    keep: list[tuple[float, int, Path]] = []
+    for mtime, size, directory in entries:
+        if max_age_days > 0 and (now - mtime) / 86400.0 > max_age_days:
+            shutil.rmtree(directory, ignore_errors=True)
+            stats["pruned"] += 1
+        else:
+            keep.append((mtime, size, directory))
+    total_bytes = sum(size for _, size, _ in keep)
+    while keep and (
+        (max_entries > 0 and len(keep) > max_entries)
+        or (max_bytes > 0 and total_bytes > max_bytes)
+    ):
+        _, size, directory = keep.pop(0)
+        shutil.rmtree(directory, ignore_errors=True)
+        total_bytes -= size
+        stats["pruned"] += 1
+    stats["entries"] = len(keep)
+    stats["bytes"] = total_bytes
+    if keep:
+        stats["oldest_age_days"] = round((now - keep[0][0]) / 86400.0, 2)
+    return stats
+
+
+# --- response cache helpers -----------------------------------------------------
+
+
+def _clone_identity(name: str) -> str:
+    """Stable identity of a clone prompt: `<name>@<mtime_ns>:<size>`.
+
+    The name alone is not enough — re-cloning a name replaces the .pt file and
+    must invalidate the audio cached under the old prompt. Falls back to the
+    bare name if the file cannot be stat'ed (the model call will fail loudly).
+    """
+    try:
+        stat = _clone_path(name).stat()
+        return f"{name}@{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        return name
+
+
+def _cache_key(
+    *,
+    text: str,
+    voice: str,
+    instruct: str | None,
+    fmt: str,
+    speed: float,
+    num_step: int,
+    gen: dict[str, Any],
+    clone_identity: str | None = None,
+) -> str:
+    """Hash of everything that can change the output bytes.
+
+    `gen` must be the fully resolved set (defaults applied), so an omitted knob
+    and an explicitly-defaulted one hash identically. Clones contribute their
+    file signature; design voices contribute the resolved instruct string.
+    """
+    payload = {
+        "text": text,
+        "voice": (voice or "").strip(),
+        "instruct": instruct or "",
+        "clone": clone_identity or "",
+        "format": fmt,
+        "speed": speed,
+        "num_step": num_step,
+        "gen": {key: gen.get(key) for key in sorted(gen)},
+    }
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _cache_dir(key: str) -> Path:
+    return CACHE_DIR / key[:2] / key
+
+
+def cache_get(key: str) -> tuple[bytes, str, str] | None:
+    """Cached `(payload, media_type, fmt)` for `key`, or None on any miss."""
+    directory = _cache_dir(key)
+    try:
+        candidates = sorted(p for p in directory.glob("audio.*") if p.is_file())
+        if not candidates:
+            return None
+        payload = candidates[0].read_bytes()
+        fmt = candidates[0].suffix.lstrip(".").lower()
+    except OSError:
+        return None
+    if fmt not in AUDIO_FORMATS:
+        return None
+    _cache_stats["hits"] += 1
+    return payload, AUDIO_FORMATS[fmt][0], fmt
+
+
+def cache_put(key: str, payload: bytes, fmt: str, echo: dict[str, Any]) -> None:
+    """Store one response; every failure is logged and swallowed."""
+    try:
+        directory = _cache_dir(key)
+        directory.mkdir(parents=True, exist_ok=True)
+        final = directory / f"audio.{fmt}"
+        tmp = directory / f"audio.{fmt}.{uuid.uuid4().hex[:6]}.tmp"
+        tmp.write_bytes(payload)
+        os.replace(tmp, final)  # atomic: readers never see a partial file
+        (directory / "meta.json").write_text(
+            json.dumps(
+                {
+                    "key": key,
+                    "created": datetime.now().isoformat(timespec="seconds"),
+                    "bytes": len(payload),
+                    "format": fmt,
+                    "hits": 0,
+                    "params": echo,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        _cache_stats["puts"] += 1
+    except OSError as error:
+        log.warning("cache write failed for %s…: %s", key[:12], error)
+        return
+    stats = prune_directory(
+        CACHE_DIR,
+        max_entries=CACHE_MAX_ENTRIES,
+        max_bytes=CACHE_MAX_BYTES,
+        max_age_days=CACHE_MAX_AGE_DAYS,
+    )
+    _cache_stats["pruned"] += stats["pruned"]
+
+
+def cache_stats() -> dict[str, Any]:
+    """Live counters plus the on-disk footprint and its limits."""
+    disk = prune_directory(CACHE_DIR, max_entries=0, max_bytes=0, max_age_days=0)
+    return {
+        "enabled": CACHE_ENABLED,
+        "dir": str(CACHE_DIR),
+        "entries": disk["entries"],
+        "bytes": disk["bytes"],
+        "oldest_age_days": disk["oldest_age_days"],
+        "limits": {
+            "entries": CACHE_MAX_ENTRIES,
+            "bytes": CACHE_MAX_BYTES,
+            "age_days": CACHE_MAX_AGE_DAYS,
+        },
+        "hits": _cache_stats["hits"],
+        "misses": _cache_stats["misses"],
+        "puts": _cache_stats["puts"],
+        "pruned": _cache_stats["pruned"],
+    }
+
+
+def api_log_append(entry: dict[str, Any]) -> None:
+    """Newest-first ring of recent endpoint requests (RAM only)."""
+    _api_log_ring.appendleft(entry)
+
+
+def save_api_record(
+    *,
+    text: str,
+    voice: str,
+    voice_mode: str,
+    instruct: str | None,
+    speed: float,
+    num_step: int,
+    fmt: str,
+    gen_overrides: dict[str, Any],
+    elapsed_ms: int,
+    payload: bytes | None,
+    cache: str,
+    client: str,
+    error: str | None = None,
+) -> dict[str, Any] | None:
+    """Archive one /v1/audio/speech request under records/ (failures included).
+
+    Rotation runs after every write, so the archive stays within its limits
+    even under sustained traffic. Never raises: the response is already on its
+    way out, archiving must not be able to fail it.
+    """
+    if not API_RECORD:
+        return None
+    try:
+        entry = save_record(
+            {
+                "source": "api",
+                "text": text,
+                "voice": voice,
+                "voice_mode": voice_mode,
+                "instruct": instruct,
+                "speed": speed,
+                "num_step": num_step,
+                "format": fmt,
+                "gen_params": gen_overrides,
+                "elapsed_ms": elapsed_ms,
+                "cache": cache,
+                "client": client,
+                **({"error": error} if error else {}),
+            },
+            payload,
+            fmt,
+            root=RECORD_DIR,
+        )
+        prune_directory(
+            RECORD_DIR,
+            max_entries=RECORD_MAX_ENTRIES,
+            max_bytes=RECORD_MAX_BYTES,
+            max_age_days=RECORD_MAX_AGE_DAYS,
+        )
+        return entry
+    except Exception:  # noqa: BLE001
+        log.warning("failed to persist api record")
+        return None
 
 
 app = FastAPI(title="OmniVoice OpenAI-compatible TTS", version="1.0.0")
@@ -625,14 +1265,19 @@ def check_auth(authorization: str | None) -> None:
 def health() -> dict[str, Any]:
     import torch
 
+    active = _find_model(MODEL_CONFIG, MODEL_CONFIG.get("active") or "")
     return {
         "status": "ok",
-        "model": MODEL_ID,
+        "model": (active or {}).get("id") or MODEL_CONFIG.get("active"),
+        "model_name": (active or {}).get("name"),
+        "model_type": (active or {}).get("type"),
         "loaded": _state["model"] is not None,
-        "device": DEVICE,
-        "dtype": DTYPE_NAME,
+        "loaded_id": _state.get("model_id"),
+        "device": MODEL_CONFIG.get("device", DEVICE),
+        "dtype": MODEL_CONFIG.get("dtype", DTYPE_NAME),
         "cuda": torch.cuda.is_available(),
         "voices": sorted(load_voices().keys()),
+        "voice_attrs": load_voices(),
         "clones": clone_names(),
         # So the console can show/restore the real per-field defaults instead
         # of a hard-coded copy that drifts from the env-overridable values.
@@ -643,7 +1288,9 @@ def health() -> dict[str, Any]:
 
 @app.get("/v1/models")
 def models() -> dict[str, Any]:
-    return {"object": "list", "data": [{"id": MODEL_ID, "object": "model", "owned_by": "local"}]}
+    active = _find_model(MODEL_CONFIG, MODEL_CONFIG.get("active") or "")
+    mid = (active or {}).get("id") or MODEL_CONFIG.get("active") or MODEL_ID
+    return {"object": "list", "data": [{"id": mid, "object": "model", "owned_by": "local"}]}
 
 
 @app.get("/v1/voices")
@@ -689,7 +1336,43 @@ async def speech(request: Request, authorization: str | None = Header(default=No
 
     voices_map = load_voices()
     instruct, clone = resolve_voice(voice, instructions, voices_map)
+    voice_mode = "clone" if clone is not None else "design"
+    client = request.client.host if request.client else ""
     started = time.perf_counter()
+
+    # --- cache lookup: byte-identical request, skip the model entirely -------
+    key = None
+    if CACHE_ENABLED:
+        key = _cache_key(
+            text=text,
+            voice=voice,
+            instruct=instruct,
+            fmt=fmt,
+            speed=speed,
+            num_step=num_step,
+            gen=gen,
+            clone_identity=_clone_identity(voice) if clone is not None else None,
+        )
+        cached = cache_get(key)
+        if cached is not None:
+            payload, media_type, _ = cached
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            log.info(
+                "tts cache hit: %d chars, voice=%r, %d bytes %s, %d ms",
+                len(text), voice, len(payload), fmt, elapsed_ms,
+            )
+            record = save_api_record(
+                text=text, voice=voice, voice_mode=voice_mode, instruct=instruct,
+                speed=speed, num_step=num_step, fmt=fmt, gen_overrides=gen_overrides,
+                elapsed_ms=elapsed_ms, payload=payload, cache="hit", client=client,
+            )
+            api_log_append({
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "status": "ok", "cache": "hit", "text": text, "voice": voice,
+                "voice_mode": voice_mode, "format": fmt, "elapsed_ms": elapsed_ms,
+                "bytes": len(payload), "client": client, "id": (record or {}).get("id"),
+            })
+            return Response(content=payload, media_type=media_type, headers={"X-Cache": "hit"})
 
     try:
         payload, media_type = run_generate(
@@ -703,53 +1386,45 @@ async def speech(request: Request, authorization: str | None = Header(default=No
         )
     except Exception as error:  # noqa: BLE001
         log.exception("generation failed")
-        if LOG_API:
-            try:
-                save_record(
-                    {
-                        "source": "api",
-                        "text": text,
-                        "voice": voice,
-                        "voice_mode": "clone" if clone is not None else "design",
-                        "instruct": instruct,
-                        "speed": speed,
-                        "num_step": num_step,
-                        "format": fmt,
-                        "gen_params": gen_overrides,
-                        "elapsed_ms": int((time.perf_counter() - started) * 1000),
-                        "error": str(error),
-                    },
-                    None,
-                    fmt,
-                )
-            except Exception:  # noqa: BLE001
-                log.warning("failed to persist error record")
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        record = save_api_record(
+            text=text, voice=voice, voice_mode=voice_mode, instruct=instruct,
+            speed=speed, num_step=num_step, fmt=fmt, gen_overrides=gen_overrides,
+            elapsed_ms=elapsed_ms, payload=None, cache="miss", client=client,
+            error=str(error),
+        )
+        api_log_append({
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "status": "error", "cache": "miss" if key else "off", "text": text,
+            "voice": voice, "voice_mode": voice_mode, "format": fmt,
+            "elapsed_ms": elapsed_ms, "bytes": 0, "client": client,
+            "error": str(error), "id": (record or {}).get("id"),
+        })
         return JSONResponse({"error": {"message": f"generation failed: {error}"}}, status_code=500)
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-    log.info("tts ok: %d chars, voice=%r, instruct=%r, %d bytes %s", len(text), voice, instruct, len(payload), fmt)
-
-    if LOG_API:
-        try:
-            save_record(
-                {
-                    "source": "api",
-                    "text": text,
-                    "voice": voice,
-                    "voice_mode": "clone" if clone is not None else "design",
-                    "instruct": instruct,
-                    "speed": speed,
-                    "num_step": num_step,
-                    "format": fmt,
-                    "gen_params": gen_overrides,
-                    "elapsed_ms": elapsed_ms,
-                },
-                payload,
-                fmt,
-            )
-        except Exception:  # noqa: BLE001
-            log.warning("failed to persist api record")
-    return Response(content=payload, media_type=media_type)
+    log.info(
+        "tts ok: %d chars, voice=%r, instruct=%r, %d bytes %s",
+        len(text), voice, instruct, len(payload), fmt,
+    )
+    if key is not None:
+        _cache_stats["misses"] += 1
+        cache_put(key, payload, fmt, echo=gen_overrides)
+    record = save_api_record(
+        text=text, voice=voice, voice_mode=voice_mode, instruct=instruct,
+        speed=speed, num_step=num_step, fmt=fmt, gen_overrides=gen_overrides,
+        elapsed_ms=elapsed_ms, payload=payload, cache="miss" if key else "off",
+        client=client,
+    )
+    api_log_append({
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "status": "ok", "cache": "miss" if key else "off", "text": text,
+        "voice": voice, "voice_mode": voice_mode, "format": fmt,
+        "elapsed_ms": elapsed_ms, "bytes": len(payload), "client": client,
+        "id": (record or {}).get("id"),
+    })
+    headers = {"X-Cache": "miss"} if key is not None else {}
+    return Response(content=payload, media_type=media_type, headers=headers)
 
 
 # --- admin console ----------------------------------------------------------
@@ -768,12 +1443,25 @@ def admin_page():
 @app.get("/admin/history", include_in_schema=False)
 def admin_history(limit: int = 50) -> dict[str, Any]:
     records = _all_records()
+    rotation = prune_directory(
+        HISTORY_DIR,
+        max_entries=HISTORY_MAX_ENTRIES,
+        max_bytes=HISTORY_MAX_BYTES,
+        max_age_days=HISTORY_MAX_AGE_DAYS,
+    )
+    rotation["limits"] = {
+        "entries": HISTORY_MAX_ENTRIES,
+        "bytes": HISTORY_MAX_BYTES,
+        "age_days": HISTORY_MAX_AGE_DAYS,
+    }
+    rotation["enabled"] = True
     return {
         "items": records[: max(1, min(limit, 500))],
         "total": len(records),
         "ok": sum(1 for r in records if r.get("status") == "ok"),
         "failed": sum(1 for r in records if r.get("status") != "ok"),
         "bytes_total": sum(int(r.get("bytes") or 0) for r in records),
+        "rotation": rotation,
     }
 
 
@@ -814,6 +1502,88 @@ def admin_audio(rid: str, download: int = 0):
     media_type = AUDIO_FORMATS.get(fmt, AUDIO_FORMATS["mp3"])[0]
     headers = {"Content-Disposition": f'attachment; filename="{rid}.{fmt}"'} if download else {}
     return Response(content=(directory / name).read_bytes(), media_type=media_type, headers=headers)
+
+
+# --- endpoint archive (records/) + live request log -----------------------------
+# Separate from history/ (console-only, manually managed): every
+# /v1/audio/speech request lands here with its audio, and rotation prunes the
+# oldest once any configured limit trips. GETs also prune, so age limits self-
+# enforce even when no new traffic arrives.
+
+
+@app.get("/admin/api-records", include_in_schema=False)
+def admin_api_records(limit: int = 50) -> dict[str, Any]:
+    records = _all_records(RECORD_DIR, url_prefix="/admin/api-audio")
+    rotation = prune_directory(
+        RECORD_DIR,
+        max_entries=RECORD_MAX_ENTRIES,
+        max_bytes=RECORD_MAX_BYTES,
+        max_age_days=RECORD_MAX_AGE_DAYS,
+    )
+    rotation["limits"] = {
+        "entries": RECORD_MAX_ENTRIES,
+        "bytes": RECORD_MAX_BYTES,
+        "age_days": RECORD_MAX_AGE_DAYS,
+    }
+    rotation["enabled"] = API_RECORD
+    return {
+        "items": records[: max(1, min(limit, 500))],
+        "total": len(records),
+        "ok": sum(1 for r in records if r.get("status") == "ok"),
+        "failed": sum(1 for r in records if r.get("status") != "ok"),
+        "bytes_total": sum(int(r.get("bytes") or 0) for r in records),
+        "rotation": rotation,
+    }
+
+
+@app.get("/admin/api-records/{rid}", include_in_schema=False)
+def admin_api_get_record(rid: str) -> dict[str, Any]:
+    rec = _read_meta(_record_dir(RECORD_DIR, rid))
+    if rec is None:
+        raise HTTPException(status_code=404, detail="record not found")
+    return rec
+
+
+@app.delete("/admin/api-records/{rid}", include_in_schema=False)
+def admin_api_delete_record(rid: str) -> dict[str, Any]:
+    directory = _record_dir(RECORD_DIR, rid)
+    if not directory.exists():
+        raise HTTPException(status_code=404, detail="record not found")
+    shutil.rmtree(directory, ignore_errors=True)
+    return {"ok": True}
+
+
+@app.delete("/admin/api-records", include_in_schema=False)
+def admin_api_clear_records() -> dict[str, Any]:
+    if RECORD_DIR.exists():
+        shutil.rmtree(RECORD_DIR, ignore_errors=True)
+    return {"ok": True}
+
+
+@app.get("/admin/api-audio/{rid}", include_in_schema=False)
+def admin_api_audio(rid: str, download: int = 0):
+    directory = _record_dir(RECORD_DIR, rid)
+    rec = _read_meta(directory)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="record not found")
+    name = rec.get("audio_file")
+    if not name or not (directory / name).exists():
+        raise HTTPException(status_code=404, detail="record has no audio")
+    fmt = Path(name).suffix.lstrip(".").lower() or "mp3"
+    media_type = AUDIO_FORMATS.get(fmt, AUDIO_FORMATS["mp3"])[0]
+    headers = {"Content-Disposition": f'attachment; filename="{rid}.{fmt}"'} if download else {}
+    return Response(content=(directory / name).read_bytes(), media_type=media_type, headers=headers)
+
+
+@app.get("/admin/api-log", include_in_schema=False)
+def admin_api_log(limit: int = 100) -> dict[str, Any]:
+    """In-memory ring of recent endpoint requests, newest first (RAM only)."""
+    items = list(_api_log_ring)
+    return {
+        "items": items[: max(1, min(limit, 500))],
+        "total": len(items),
+        "cache": cache_stats(),
+    }
 
 
 _REF_SUFFIXES = (".ref.wav", ".ref.mp3", ".ref.flac", ".ref.ogg", ".ref.m4a", ".ref.aac")
@@ -857,6 +1627,160 @@ def admin_languages() -> dict[str, Any]:
         "ids": sorted(LANG_IDS),
         "names": sorted(LANG_NAMES),
     }
+
+
+# --- model management (console) ---------------------------------------------
+# List / switch / register / delete / scan the models in model_config.json.
+# `load` swaps the live model at runtime and persists the choice; it runs off the
+# event loop (run_in_threadpool) so the 60–90 s load never blocks requests.
+
+@app.get("/admin/models", include_in_schema=False)
+def admin_models() -> dict[str, Any]:
+    cfg = MODEL_CONFIG
+    active = cfg.get("active")
+    active_entry = _find_model(cfg, active) or {}
+    return {
+        "active": active,
+        "device": cfg.get("device"),
+        "dtype": cfg.get("dtype"),
+        "num_step": cfg.get("num_step"),
+        "asr_model": _resolve_model_ref(cfg.get("asr_model")),
+        "loaded": _state["model"] is not None,
+        "loaded_id": _state.get("model_id"),
+        "current": {
+            "id": active_entry.get("id"),
+            "name": active_entry.get("name"),
+            "type": active_entry.get("type"),
+            "path": str(_entry_path(active_entry)) if active_entry else None,
+        },
+        "models": [
+            {**e, "path": str(_entry_path(e)), "active": e.get("id") == active}
+            for e in cfg.get("models", [])
+        ],
+        "scan_dirs": [str(p) for p in _model_scan_roots()],
+    }
+
+
+@app.post("/admin/models/load", include_in_schema=False)
+async def admin_models_load(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    model_id = str(body.get("id") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="缺少 id")
+    try:
+        return await run_in_threadpool(reload_model, model_id)
+    except HTTPException:
+        raise
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"加载失败：{error}")
+
+
+@app.post("/admin/models/register", include_in_schema=False)
+async def admin_models_register(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    model_id = str(body.get("id") or "").strip()
+    name = str(body.get("name") or "").strip()
+    path = str(body.get("path") or "").strip()
+    mtype = str(body.get("type") or "checkpoint").strip().lower()
+    base = str(body.get("base") or "").strip() or None
+    if not model_id or not name or not path:
+        raise HTTPException(status_code=400, detail="id / name / path 均为必填")
+    if mtype not in ("checkpoint", "lora"):
+        raise HTTPException(status_code=400, detail="type 只能是 checkpoint 或 lora")
+    p = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(path.strip()))))
+    if not p.exists():
+        raise HTTPException(status_code=400, detail=f"路径不存在：{p}")
+    if mtype == "lora" and base is None:
+        base = _first_checkpoint_id(MODEL_CONFIG)
+    cfg = MODEL_CONFIG
+    if _find_model(cfg, model_id) is not None:
+        raise HTTPException(status_code=409, detail=f"模型 id「{model_id}」已存在")
+    cfg["models"].append(
+        {
+            "id": model_id,
+            "name": name,
+            "path": _store_path(p),
+            "type": mtype,
+            **({"base": base} if mtype == "lora" else {}),
+        }
+    )
+    save_config(cfg)
+    return {"ok": True, "models": cfg["models"]}
+
+
+@app.delete("/admin/models/{model_id}", include_in_schema=False)
+def admin_models_delete(model_id: str) -> dict[str, Any]:
+    if model_id == "base":
+        raise HTTPException(status_code=400, detail="base 是默认模型，不可删除")
+    if model_id == MODEL_CONFIG.get("active"):
+        raise HTTPException(status_code=400, detail="当前正在使用的模型不可删除（先切换到其它模型）")
+    cfg = MODEL_CONFIG
+    before = len(cfg["models"])
+    cfg["models"] = [e for e in cfg["models"] if e.get("id") != model_id]
+    if len(cfg["models"]) == before:
+        raise HTTPException(status_code=404, detail="未找到模型")
+    save_config(cfg)
+    return {"ok": True, "models": cfg["models"]}
+
+
+@app.post("/admin/models/scan", include_in_schema=False)
+def admin_models_scan() -> dict[str, Any]:
+    """Scan known directories for loadable model folders not yet registered."""
+    dirs = _model_scan_roots()
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    registered_paths = {
+        str(_entry_path(e)) for e in MODEL_CONFIG.get("models", [])
+    }
+    for d in dirs:
+        if not d.exists() or not d.is_dir():
+            continue
+        for sub in sorted(d.iterdir()):
+            if not sub.is_dir():
+                continue
+            mtype = _detect_model_type(sub)
+            if mtype is None:
+                continue
+            key = str(sub)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(
+                {
+                    "path": str(sub),
+                    "type": mtype,
+                    "name": sub.name,
+                    "registered": key in registered_paths
+                    or str(sub.resolve()) in registered_paths,
+                }
+            )
+    return {"ok": True, "dirs": [str(d) for d in dirs], "found": found}
+
+
+def _detect_model_type(folder: Path) -> str | None:
+    """Classify a directory as 'lora' or 'checkpoint' (or None if not a model)."""
+    if (folder / "adapter_config.json").exists():
+        return "lora"
+    cfg_file = folder / "config.json"
+    if cfg_file.is_file():
+        try:
+            obj = json.loads(cfg_file.read_text(encoding="utf-8"))
+            arch = obj.get("architectures") or []
+            if any("OmniVoice" in str(a) for a in arch):
+                return "checkpoint"
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 def _decode_audio(raw: bytes) -> tuple[Any, int]:
@@ -1165,6 +2089,15 @@ def _resolve_local(raw_path: str) -> Path:
         return target.resolve()
     except Exception:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"路径不可解析：{raw_path}")
+
+
+def _entry_path(entry: dict[str, Any]) -> Path:
+    """Resolve a registry entry's stored path back to an absolute path."""
+    raw = str(entry.get("path") or "").strip()
+    p = Path(raw)
+    if not p.is_absolute():
+        p = HERE / p
+    return p
 
 
 def _safe_name(raw_name: str, trim: bool = True) -> str:
@@ -1824,6 +2757,7 @@ def start_tray() -> None:
 def main() -> None:
     port = int(os.environ.get("OMNI_TTS_PORT", "8890"))
     host = os.environ.get("OMNI_TTS_HOST", "127.0.0.1")
+    setup_logging()
     try:
         get_model()
     except Exception as error:  # noqa: BLE001
@@ -1831,10 +2765,25 @@ def main() -> None:
         sys.exit(1)
     log.info("listening on http://%s:%d", host, port)
     log.info("admin console: http://%s:%d/admin", host, port)
+    log.info("log file: %s (<=%d MB x %d backups)", LOG_FILE, LOG_MAX_BYTES // 1048576, LOG_BACKUPS)
     log.info("history archive: %s", HISTORY_DIR)
+    if API_RECORD:
+        log.info(
+            "api records: %s (<=%d entries / <=%d MB / <=%g days)",
+            RECORD_DIR, RECORD_MAX_ENTRIES, RECORD_MAX_BYTES // 1048576, RECORD_MAX_AGE_DAYS,
+        )
+    else:
+        log.info("api records: disabled (OMNI_API_RECORD=0)")
+    if CACHE_ENABLED:
+        log.info("response cache: %s", CACHE_DIR)
+    else:
+        log.info("response cache: disabled (OMNI_CACHE=0)")
     log.info("cloned voices: %s (%d stored)", CLONE_DIR, len(clone_names()))
     start_tray()
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # log_config=None: uvicorn skips its own logging setup, so its records
+    # (including the access log) propagate to the root handlers installed by
+    # setup_logging() and land in the rotating server.log.
+    uvicorn.run(app, host=host, port=port, log_level="info", log_config=None)
 
 
 if __name__ == "__main__":

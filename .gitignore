@@ -23,6 +23,10 @@ __pycache__/
 
 # ===== 管理台请求归档（请求参数 + 音频产出，运行时生成）=====
 /history/
+
+# ===== OpenAI 端点记录与响应缓存（运行时生成，按需轮转）=====
+/records/
+/cache/
 *.pyc
 *.pyo
 
@@ -32,6 +36,17 @@ ehthumbs.db
 .DS_Store
 .vscode/
 .idea/
+
+# ===== 模型注册表（本机运行时配置，含本机绝对路径，不入库）=====
+/model_config.json
+/model_config.json.tmp
+
+# ===== 外部权重挂载点（Windows 目录联接，不是真实内容，不入库）=====
+/finetunes/
+
+# ===== 本地运行时痕迹 =====
+/.workbuddy/
+server.log.bak
 
 # ===== 本地随手笔记（端点速查等，非项目文档）=====
 /端口.txt
