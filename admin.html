@@ -136,6 +136,7 @@
   <nav class="anchors">
     <a href="#synthesize">发起合成</a>
     <a href="#voices">音色库</a>
+    <a href="#voicegroups">音色分组</a>
     <a href="#history">历史记录</a>
     <a href="#models">模型管理</a>
     <a href="#config">配置</a>
@@ -374,6 +375,23 @@
     </div>
     <div id="vcStatus"></div>
     <div id="vcList" style="margin-top:14px"><div class="empty">加载中…</div></div>
+  </section>
+
+  <section class="card" id="voicegroups">
+    <h2>音色分组</h2>
+    <div class="hint">
+      把多个<b>同角色不同情绪</b>的音色归到一个分组：生成时 voice 字段填<b>分组名</b>（如 <code>甘雨</code>），
+      系统按<b>情绪子标签</b>（DSHT 的「用X的语气说这句话。」解析出的英文标签，如 <code>happy</code>）自动切换到对应情绪音色；
+      若没带情绪标签（或没命中），取该组的<b>默认音色</b>。<b>每个分组必须指定一个默认音色</b>。
+      子标签填情绪映射<b>后的英文标签</b>（如 <code>happy/sad/angry/whisper/calm/excited/nervous/singing</code>），也可自定。
+      DSHT 实际会穿的中文情绪词参考：<code>开心/高兴/温柔/害羞/关心/钦佩/逗乐/感激/得意/兴奋/激动/好奇/期待/难过/伤心/失望/生气/愤怒/烦躁/紧张/不安/害怕/困惑/平静/冷静/释然/惊讶/叹气/唱歌</code> 等——
+      它们经情绪映射变成上面的英文标签，分组子标签请填英文标签。
+    </div>
+    <div class="row">
+      <button id="vgNew" class="primary" type="button">新建分组</button>
+      <span class="stats" id="vgStats"></span>
+    </div>
+    <div id="vgList" style="margin-top:14px"><div class="empty">加载中…</div></div>
   </section>
 
   <section class="card" id="history">
@@ -768,6 +786,10 @@ function renderVoiceList(items) {
         ${v.created ? `<span class="meta">${esc(fmtTime(v.created))}</span>` : ""}
       </div>
       <div class="text">ref_text：${esc(v.ref_text || "-")}</div>
+      <div class="row" style="margin-top:6px">
+        <input class="vnote" value="${esc(v.note || "")}" placeholder="备注（任意说明）" style="flex:1">
+        <button data-vact="note">保存备注</button>
+      </div>
       <audio controls preload="none" src="/admin/voices/${encodeURIComponent(v.name)}/audio"></audio>
       <div class="rec-actions">
         <button data-vact="use">用于生成</button>
@@ -790,6 +812,7 @@ async function loadVoices() {
   $("vcStats").textContent = `已存 ${data.total} 个音色`;
   renderVoiceList(items);
   syncVoiceOptions();
+  loadVoiceGroups();
 }
 
 /* ---- clone from a local path: server reads the file and its sibling transcript ---- */
@@ -938,6 +961,18 @@ $("vcList").addEventListener("click", async (ev) => {
   } else if (btn.dataset.vact === "use") {
     $("voice").value = name;
     window.scrollTo({ top: 0, behavior: "smooth" });
+  } else if (btn.dataset.vact === "note") {
+    const note = btn.closest(".rec").querySelector(".vnote").value;
+    try {
+      await fetch("/admin/voices/" + encodeURIComponent(name), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note }),
+      });
+      loadVoices();
+    } catch (e) {
+      alert("保存备注失败：" + e);
+    }
   }
 });
 
@@ -1778,6 +1813,117 @@ document.querySelectorAll(".anchors a[href^=\"#\"]").forEach((a) => {
 Promise.all([loadSettings(), loadEmotionMap(), loadModels()]).then(() => {
   if (location.hash) seekToHash(location.hash, false);
 });
+
+/* ---------- voice groups ---------- */
+let VG_VOICES = [];
+
+function vgVoiceOptions(sel) {
+  const opts = ['<option value=""></option>'].concat(
+    (VG_VOICES || []).map((v) => `<option value="${esc(v)}" ${v === sel ? "selected" : ""}>${esc(v)}</option>`)
+  );
+  return opts.join("");
+}
+
+function vgMemberRow(m) {
+  m = m || {};
+  return `<div class="vg-member" style="display:flex;gap:6px;margin:4px 0">
+    <select class="vg-mvoice" style="flex:2">${vgVoiceOptions(m.voice)}</select>
+    <input class="vg-mtag" style="flex:1" value="${esc(m.tag || "")}" placeholder="子标签(如 happy)">
+    <input class="vg-mnote" style="flex:2" value="${esc(m.note || "")}" placeholder="成员备注">
+    <button class="vg-mdel danger" type="button">×</button>
+  </div>`;
+}
+
+function renderVoiceGroups(groups) {
+  if (!groups.length) {
+    $("vgList").innerHTML = `<div class="empty">还没有分组。点击「新建分组」，把同角色不同情绪的音色归到一起。</div>`;
+    return;
+  }
+  $("vgList").innerHTML = groups.map((g) => `
+    <div class="rec" data-gname="${esc(g.name)}">
+      <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
+        <span class="badge grp">分组</span>
+        <input class="vg-name" value="${esc(g.name)}" placeholder="分组名（作为 voice 标签）">
+        <label>默认</label>
+        <select class="vg-default">${vgVoiceOptions(g.default)}</select>
+        <input class="vg-note" value="${esc(g.note || "")}" placeholder="分组备注" style="flex:1;min-width:160px">
+        <button class="vg-del danger" type="button">删除分组</button>
+      </div>
+      <div class="vg-members">${(g.members || []).map(vgMemberRow).join("")}</div>
+      <div class="row">
+        <button class="vg-madd" type="button">+ 添加成员</button>
+        <span class="spacer"></span>
+        <button class="vg-save primary" type="button">保存全部</button>
+      </div>
+    </div>`).join("");
+}
+
+async function loadVoiceGroups() {
+  let data;
+  try {
+    const r = await fetch("/admin/voice-groups");
+    data = await r.json();
+  } catch (e) {
+    $("vgList").innerHTML = `<div class="empty">读取分组失败：${esc(e)}</div>`;
+    return;
+  }
+  VG_VOICES = data.voices || [];
+  renderVoiceGroups(data.groups || []);
+  $("vgStats").textContent = `共 ${(data.groups || []).length} 个分组`;
+}
+
+function collectGroups() {
+  return [...$("vgList").querySelectorAll(".rec")].map((rec) => ({
+    name: rec.querySelector(".vg-name").value.trim(),
+    default: rec.querySelector(".vg-default").value,
+    note: rec.querySelector(".vg-note").value.trim(),
+    members: [...rec.querySelectorAll(".vg-member")].map((m) => ({
+      voice: m.querySelector(".vg-mvoice").value,
+      tag: m.querySelector(".vg-mtag").value.trim(),
+      note: m.querySelector(".vg-mnote").value.trim(),
+    })).filter((x) => x.voice),
+  })).filter((g) => g.name);
+}
+
+async function saveVoiceGroups() {
+  const groups = collectGroups();
+  const missing = groups.filter((g) => !g.default);
+  if (missing.length) {
+    alert("以下分组缺少默认音色（必须指定一个组默认音色）：\n" + missing.map((g) => g.name).join("、"));
+    return;
+  }
+  try {
+    const r = await fetch("/admin/voice-groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ groups }),
+    });
+    const d = await r.json();
+    if (!r.ok) { alert("保存失败：" + (d.detail || r.status)); return; }
+    $("vgStats").textContent = `共 ${d.groups} 个分组`;
+    loadVoiceGroups();
+  } catch (e) {
+    alert("保存异常：" + e);
+  }
+}
+
+$("vgNew").onclick = () => {
+  const empty = `<div class="rec" data-gname=""><div class="row" style="flex-wrap:wrap;gap:6px;align-items:center"><span class="badge grp">分组</span><input class="vg-name" placeholder="分组名（作为 voice 标签）"><label>默认</label><select class="vg-default">${vgVoiceOptions("")}</select><input class="vg-note" placeholder="分组备注" style="flex:1;min-width:160px"><button class="vg-del danger" type="button">删除分组</button></div><div class="vg-members">${vgMemberRow({})}</div><div class="row"><button class="vg-madd" type="button">+ 添加成员</button><span class="spacer"></span><button class="vg-save primary" type="button">保存全部</button></div></div>`;
+  $("vgList").insertAdjacentHTML("afterbegin", empty);
+};
+
+$("vgList").addEventListener("click", (ev) => {
+  const rec = ev.target.closest(".rec");
+  if (!rec) return;
+  if (ev.target.classList.contains("vg-del")) { rec.remove(); return; }
+  if (ev.target.classList.contains("vg-madd")) {
+    rec.querySelector(".vg-members").insertAdjacentHTML("beforeend", vgMemberRow({}));
+    return;
+  }
+  if (ev.target.classList.contains("vg-mdel")) { ev.target.closest(".vg-member").remove(); return; }
+  if (ev.target.classList.contains("vg-save")) { saveVoiceGroups(); return; }
+});
+
 </script>
 </body>
 </html>

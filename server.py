@@ -87,12 +87,76 @@ if str(HERE) not in sys.path:
 # it, so the code below keeps using plain os.environ.get(...) unchanged. A
 # variable already present in the real environment wins: an operator can
 # always override a stored value for a single run.
+
+# Voice groups: a group name behaves as a voice label; a sub-tag (the emotion
+# tag resolved from DSH-Tavern's instruction, e.g. "happy") selects a member
+# voice inside the group, falling back to the group's mandatory default when no
+# tag matches. See voice_groups.json for the on-disk shape.
+VOICE_GROUPS_FILE = Path(os.environ.get("OMNI_VOICE_GROUPS", HERE / "voice_groups.json"))
+_VOICE_GROUPS: dict[str, dict] = {}
+
+
+def load_voice_groups() -> dict[str, dict]:
+    """Load voice groups from voice_groups.json.
+
+    A group is dropped unless it has both a name and a non-empty `default`
+    voice (the mandatory group default). Members without a voice are skipped.
+    On disk: {"groups": [{"name", "default", "note",
+    "members":[{"voice","tag","note"}]}]}.
+    """
+    if not VOICE_GROUPS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(VOICE_GROUPS_FILE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    raw = data.get("groups")
+    if not isinstance(raw, list):
+        return {}
+    out: dict[str, dict] = {}
+    for g in raw:
+        if not isinstance(g, dict):
+            continue
+        name = str(g.get("name", "")).strip()
+        default = str(g.get("default", "")).strip()
+        if not name or not default:
+            continue
+        members: list[dict[str, str]] = []
+        for m in g.get("members", []) or []:
+            if not isinstance(m, dict):
+                continue
+            mv = str(m.get("voice", "")).strip()
+            if not mv:
+                continue
+            members.append({
+                "voice": mv,
+                "tag": str(m.get("tag", "")).strip(),
+                "note": str(m.get("note", "")).strip(),
+            })
+        out[name] = {
+            "name": name,
+            "default": default,
+            "note": str(g.get("note", "")).strip(),
+            "members": members,
+        }
+    return out
+
+
+def reload_voice_groups() -> None:
+    """Reload groups from disk into the live dict."""
+    _VOICE_GROUPS.clear()
+    _VOICE_GROUPS.update(load_voice_groups())
+
+
 try:
     import settings as _settings  # noqa: E402
     import emotion_map as _emotion_map  # noqa: E402
 
     _INJECTED = _settings.apply_configured_env()
     _EMOTION_TABLE = _emotion_map.ensure_map()
+    reload_voice_groups()
     if _INJECTED:
         # logging is not configured yet this early, so this line goes to
         # stderr only; the same list is repeated in the startup log below.
@@ -1150,6 +1214,14 @@ class VoiceParts:
     # Emotion phrases that the adapter turned into a tag, as
     # "phrase -> target" pairs.
     emotion_mapped: list[dict[str, str]] = field(default_factory=list)
+    # Voice-group resolution: when the voice field named a group, the matched
+    # member (or the group default) is loaded as `clone` above; these record
+    # which group fired and whether a sub-tag actually matched a member.
+    group_name: str = ""
+    group_default: str = ""
+    group_selected: str = ""
+    group_tag: str = ""
+    group_fell_back: bool = False
 
     @property
     def inline_prefix(self) -> str:
@@ -1233,6 +1305,7 @@ def parse_voice_field(
     inline_tags: tuple[str, ...],
     emotion_table: dict[str, list[str]] | None = None,
     blocked: frozenset[str] = frozenset(),
+    groups: dict[str, dict] | None = None,
 ) -> VoiceParts:
     """Resolve a free-form voice field into attributes, a clone and tags.
 
@@ -1256,6 +1329,16 @@ def parse_voice_field(
     # The leftovers are where the emotion phrases live: "害羞" on its own,
     # or DSH-Tavern's whole "用害羞的语气说这句话。".
     leftover: list[str] = []
+
+    # A group name in the voice field takes priority over being read as an
+    # emotion phrase: claim it before the emotion pass consumes it.
+    if groups:
+        for frag in list(unknown):
+            if frag.strip() in groups:
+                parts.group_name = frag.strip()
+                unknown.remove(frag)
+                break
+
     if emotion_table and unknown:
         # Anything already recognised is off limits to phrase matching, so a
         # phrase cannot bite into a clone name that shares its characters.
@@ -1299,6 +1382,31 @@ def parse_voice_field(
         parts.dropped.extend(conflicts)
 
     return parts
+
+
+def _select_group_voice(group: dict, candidates: list[str]) -> tuple[str, str, bool]:
+    """Pick the member whose tag matches a candidate, else the group default.
+
+    Exact (case-folded) match wins; a substring match is a fallback for tags
+    written in either direction. Returns (voice, matched_tag, fell_back).
+    """
+    members = group.get("members", []) or []
+    for cand in candidates:
+        c = (cand or "").casefold()
+        if not c:
+            continue
+        for m in members:
+            if m["tag"].casefold() == c:
+                return m["voice"], m["tag"], False
+    for cand in candidates:
+        c = (cand or "").casefold()
+        if not c:
+            continue
+        for m in members:
+            t = m["tag"].casefold()
+            if t and (t in c or c in t):
+                return m["voice"], m["tag"], False
+    return group.get("default", ""), "", True
 
 
 def _clone_path(name: str) -> Path:
@@ -1357,7 +1465,9 @@ def resolve_voice(
     valid, _, _, _ = _load_design_vocab()
     blocked = _emotion_map.blocked_targets(valid) if _emotion_map is not None else frozenset()
 
-    parts = parse_voice_field(voice or "", voices, clones, inline_tags, table, blocked)
+    parts = parse_voice_field(
+        voice or "", voices, clones, inline_tags, table, blocked, groups=_VOICE_GROUPS
+    )
 
     # Always parsed: an emotion phrase here is the only channel DSH-Tavern
     # has for expressing one, and the mapping layer turns it into a tag.
@@ -1385,6 +1495,25 @@ def resolve_voice(
             merged, dropped = _merge_instructs(parts.instruct, extra_parts.instruct)
             parts.instruct = merged
             parts.dropped.extend(dropped)
+
+    # Voice-group resolution: if the voice field named a group, pick a member
+    # by the resolved emotion sub-tag, else fall back to the group default.
+    if parts.group_name and parts.group_name in _VOICE_GROUPS:
+        grp = _VOICE_GROUPS[parts.group_name]
+        candidates = list(parts.inline_tags)
+        for em in parts.emotion_mapped:
+            t = (em or {}).get("target", "")
+            if t and t not in candidates:
+                candidates.append(t)
+        sel, tag, fell = _select_group_voice(grp, candidates)
+        parts.group_default = grp["default"]
+        parts.group_selected = sel
+        parts.group_tag = tag
+        parts.group_fell_back = fell
+        chosen = get_clone(sel)
+        if chosen is not None:
+            parts.clone = chosen
+            parts.clone_name = sel
 
     return (parts.instruct or None), parts.clone, parts
 
@@ -2160,6 +2289,76 @@ def admin_voices() -> dict[str, Any]:
     return {"items": items, "total": len(items)}
 
 
+@app.get("/admin/voice-groups", include_in_schema=False)
+def admin_voice_groups() -> dict[str, Any]:
+    """Current voice groups plus the clone names available for dropdowns."""
+    return {"groups": list(_VOICE_GROUPS.values()), "voices": clone_names()}
+
+
+@app.post("/admin/voice-groups", include_in_schema=False)
+async def admin_save_voice_groups(payload: dict = {}) -> dict[str, Any]:
+    """Replace the whole group set. Each group must name a default voice."""
+    raw = payload.get("groups") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="groups 必须是数组")
+    cleaned: list[dict] = []
+    errors: list[str] = []
+    for g in raw:
+        if not isinstance(g, dict):
+            errors.append("分组必须是对象")
+            continue
+        name = str(g.get("name", "")).strip()
+        default = str(g.get("default", "")).strip()
+        if not name:
+            errors.append("存在未命名分组")
+            continue
+        if not default:
+            errors.append(f"分组「{name}」缺少默认音色（必须指定一个组默认音色）")
+            continue
+        members = []
+        for m in g.get("members", []) or []:
+            if not isinstance(m, dict):
+                continue
+            mv = str(m.get("voice", "")).strip()
+            if not mv:
+                continue
+            members.append({
+                "voice": mv,
+                "tag": str(m.get("tag", "")).strip(),
+                "note": str(m.get("note", "")).strip(),
+            })
+        cleaned.append({
+            "name": name,
+            "default": default,
+            "note": str(g.get("note", "")).strip(),
+            "members": members,
+        })
+    if errors:
+        raise HTTPException(status_code=400, detail="；".join(errors))
+    out = {"version": 1, "groups": cleaned}
+    tmp = VOICE_GROUPS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, VOICE_GROUPS_FILE)
+    reload_voice_groups()
+    return {"ok": True, "groups": len(cleaned)}
+
+
+@app.patch("/admin/voices/{name}", include_in_schema=False)
+async def admin_patch_voice(name: str, payload: dict = {}) -> dict[str, Any]:
+    """Update a clone's metadata (currently just `note`)."""
+    meta = CLONE_DIR / f"{name}.json"
+    if not meta.exists():
+        raise HTTPException(status_code=404, detail="音色不存在")
+    try:
+        data = json.loads(meta.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        data = {}
+    if isinstance(payload, dict) and "note" in payload:
+        data["note"] = str(payload["note"]).strip()
+    meta.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "name": name, "note": data.get("note", "")}
+
+
 @app.get("/admin/languages", include_in_schema=False)
 def admin_languages() -> dict[str, Any]:
     """The model's language table, for `language=` autocomplete.
@@ -2813,6 +3012,7 @@ def _store_clone(
                 "source": source,
                 "preprocess_prompt": bool(pp),
                 "created": datetime.now().isoformat(timespec="seconds"),
+                "note": "",
             },
             ensure_ascii=False,
             indent=2,
