@@ -139,6 +139,7 @@
     <a href="#history">历史记录</a>
     <a href="#models">模型管理</a>
     <a href="#config">配置</a>
+    <a href="#emotionmap">情绪标签映射</a>
     <a href="#apirec" class="accent">API 记录 / 请求日志</a>
   </nav>
 </header>
@@ -444,8 +445,10 @@
     </div>
     <div id="cfgGroups"></div>
     <div id="cfgStatus"></div>
+  </section>
 
-    <h3 class="sub">情绪标签映射 <span class="meta">（DSHT 适配层）</span></h3>
+  <section class="card" id="emotionmap">
+    <h2>情绪标签映射 <span class="meta">（DSHT 适配层）</span></h2>
     <div class="hint" style="margin:0 0 10px">
       DSHT 发在 <code>instructions</code> 里的情绪短语（如「温柔地」）不在 OmniVoice 的属性白名单里，
       原本会被丢弃。这里把短语映射到模型真正认得的标签：映射到<b>行内标签</b>的会加到文本开头，
@@ -1631,9 +1634,26 @@ $("emOnlyUnusable").addEventListener("change", () => {
   renderEmotionMap({ mappings: EM_ROWS, targets: EM_TARGETS, inline_tags: [] });
 });
 
-loadSettings();
-loadEmotionMap();
-loadModels();
+/* The sections below render asynchronously, so a hash the browser resolved
+   against the still-empty layout lands short of its target. Seek again once
+   the lists are in, and route anchor clicks through the same path. */
+function seekToHash(hash, smooth) {
+  const id = (hash || "").replace(/^#/, "");
+  const el = id && document.getElementById(id);
+  if (el) el.scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "start" });
+}
+document.querySelectorAll(".anchors a[href^=\"#\"]").forEach((a) => {
+  a.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    const hash = a.getAttribute("href");
+    history.replaceState(null, "", hash);
+    seekToHash(hash, true);
+  });
+});
+
+Promise.all([loadSettings(), loadEmotionMap(), loadModels()]).then(() => {
+  if (location.hash) seekToHash(location.hash, false);
+});
 </script>
 </body>
 </html>
