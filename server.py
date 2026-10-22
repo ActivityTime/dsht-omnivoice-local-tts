@@ -1529,9 +1529,19 @@ def resolve_voice(
         grp = _VOICE_GROUPS[parts.group_name]
         candidates = list(parts.inline_tags)
         for em in parts.emotion_mapped:
-            t = (em or {}).get("target", "")
-            if t and t not in candidates:
-                candidates.append(t)
+            # emotion_map records {"phrase": <original text>, "targets": "a,b"}:
+            # `targets` is a comma-joined string of the tags the phrase mapped
+            # to, not a single `target`. Both the original phrase and every
+            # resolved tag are candidates, so a group member may be tagged with
+            # the Chinese phrase the adapter sent ("期待") or with the English
+            # tag it resolved to ("excited").
+            ph = (em or {}).get("phrase") or ""
+            if ph and ph not in candidates:
+                candidates.append(ph)
+            for t in str((em or {}).get("targets") or "").split(","):
+                t = t.strip()
+                if t and t not in candidates:
+                    candidates.append(t)
         sel, tag, fell = _select_group_voice(grp, candidates)
         parts.group_default = grp["default"]
         parts.group_selected = sel
@@ -2030,25 +2040,7 @@ async def speech(request: Request, authorization: str | None = Header(default=No
     # What each item in the voice field resolved to. Kept in the archive so
     # the console can show dropped items, the matched clone and the inline
     # tags instead of leaving the user guessing.
-    voice_report = {
-        "dropped": voice_parts.dropped,
-        "matched_clone": voice_parts.clone_name,
-        "clone_preprocessed": _clone_preprocessed(voice_parts.clone_name),
-        "inline_tags": voice_parts.inline_tags,
-        "presets": voice_parts.presets,
-        # What the caller actually sent, so the archive can be read back.
-        "instructions": instructions,
-        "emotion_mapped": voice_parts.emotion_mapped,
-        # Voice-group resolution trace: which group fired, what sub-tag matched,
-        # and whether we fell back to the mandatory group default. Without this
-        # the archive cannot tell that "甘雨" actually resolved to a specific
-        # member voice (or to the default) -- the real voice is invisible.
-        "group_name": voice_parts.group_name,
-        "group_default": voice_parts.group_default,
-        "group_selected": voice_parts.group_selected,
-        "group_tag": voice_parts.group_tag,
-        "group_fell_back": voice_parts.group_fell_back,
-    }
+    voice_report = _voice_report(voice_parts, instructions)
     client = request.client.host if request.client else ""
     started = time.perf_counter()
 
@@ -3028,6 +3020,32 @@ def _clone_preprocessed(name: str | None) -> bool | None:
         return None
 
 
+def _voice_report(parts: VoiceParts, instructions: str | None) -> dict[str, Any]:
+    """What the voice field + instructions resolved to, for logs and archives.
+
+    Carries the voice-group trace so an archive entry can tell that a group
+    name like "甘雨" actually resolved to member X by sub-tag, or fell back to
+    the mandatory group default -- without it the real voice is invisible.
+    Also records whether that clone was built with `preprocess_prompt=True`
+    (the legacy default that can sound rushed).
+    """
+    return {
+        "dropped": parts.dropped,
+        "matched_clone": parts.clone_name,
+        "clone_preprocessed": _clone_preprocessed(parts.clone_name),
+        "inline_tags": parts.inline_tags,
+        "presets": parts.presets,
+        # What the caller actually sent, so the archive can be read back.
+        "instructions": instructions,
+        "emotion_mapped": parts.emotion_mapped,
+        "group_name": parts.group_name,
+        "group_default": parts.group_default,
+        "group_selected": parts.group_selected,
+        "group_tag": parts.group_tag,
+        "group_fell_back": parts.group_fell_back,
+    }
+
+
 def _store_clone(
     name: str,
     wave: Any,
@@ -3659,23 +3677,11 @@ async def admin_generate(request: Request):
         "text": text,
         "voice": voice,
         "voice_mode": _voice_mode(clone, instruct),
-        "instructions": instructions,
-        "instruct": instruct,
+        **_voice_report(voice_parts, instructions),
         "speed": speed,
         "num_step": num_step,
         "format": fmt,
         "gen_params": gen_overrides,
-        # What each item in the voice field resolved to.
-        "dropped": voice_parts.dropped,
-        "matched_clone": voice_parts.clone_name,
-        "clone_preprocessed": _clone_preprocessed(voice_parts.clone_name),
-        "inline_tags": voice_parts.inline_tags,
-        "presets": voice_parts.presets,
-        "group_name": voice_parts.group_name,
-        "group_default": voice_parts.group_default,
-        "group_selected": voice_parts.group_selected,
-        "group_tag": voice_parts.group_tag,
-        "group_fell_back": voice_parts.group_fell_back,
     }
 
     started = time.perf_counter()

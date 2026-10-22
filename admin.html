@@ -1023,7 +1023,7 @@ async function loadHistory() {
         <span class="meta">${esc(r.id)}</span>
       </div>
       <div class="text">${esc(r.text)}</div>
-      <div class="chips">${chips}${r.instruct ? `<span class="chip">属性: ${esc(r.instruct)}</span>` : ""}${gpChips}</div>
+      <div class="chips">${chips}${r.instruct ? `<span class="chip">属性: ${esc(r.instruct)}</span>` : ""}${r.matched_clone ? `<span class="chip">音色: ${esc(r.matched_clone)}</span>` : ""}${r.emotion_mapped && r.emotion_mapped.length ? `<span class="chip">情绪: ${esc(r.emotion_mapped.map((e) => `${e.phrase}→${e.targets}`).join(" / "))}</span>` : ""}${r.group_name ? `<span class="chip">分组: ${esc(r.group_fell_back ? `${r.group_name}→默认(${r.group_default || "?"})` : `${r.group_name}→${r.group_selected || "?"}${r.group_tag ? `[${r.group_tag}]` : ""}`)}</span>` : ""}${r.clone_preprocessed === true ? `<span class="chip chip-warn">预处理音色</span>` : ""}${gpChips}</div>
       ${r.error ? `<div class="text" style="color:var(--err)">${esc(r.error)}</div>` : ""}
       ${audio}
       <div class="rec-actions">
@@ -1117,6 +1117,15 @@ async function loadApiRecords() {
     if (r.inline_tags && r.inline_tags.length) parseChips.push(`行内标签=${r.inline_tags.map((t) => "[" + t + "]").join("")}`);
     if (r.instruct) parseChips.push(`属性=${r.instruct}`);
     if (r.dropped && r.dropped.length) parseChips.push(`丢弃=${r.dropped.join(",")}`);
+    if (r.emotion_mapped && r.emotion_mapped.length) {
+      parseChips.push(`情绪=${r.emotion_mapped.map((e) => `${e.phrase}→${e.targets}`).join(" / ")}`);
+    }
+    if (r.group_name) {
+      parseChips.push(r.group_fell_back
+        ? `分组=${r.group_name}→默认(${r.group_default || "?"})`
+        : `分组=${r.group_name}→${r.group_selected || "?"}${r.group_tag ? `[${r.group_tag}]` : ""}`);
+    }
+    if (r.clone_preprocessed === true) parseChips.push("音色=预处理");
     const parseHtml = parseChips.length
       ? `<div class="chips">${parseChips.map((c) => `<span class="chip">${esc(c)}</span>`).join("")}</div>`
       : "";
