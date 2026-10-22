@@ -272,8 +272,19 @@ OmniVoice 建克隆 prompt 时会做三步预处理：裁掉参考音频里的�
 | DELETE | `/admin/voices/{name}` | 删除音色及其参考音频 |
 | GET | `/admin/voices/{name}/audio` | 回听原始参考音频 |
 
-> 两种模式**互斥**：`voice` 命中克隆音色时，属性串不再参与生成（音色已由参考音频决定）。
+> **本机服务里两种模式互斥**：`voice` 命中克隆音色时，属性串**不参与**生成
+> （`server.py` 的 `resolve_voice()` 命中克隆即返回 `instruct=None`，`run_generate()` 里
+> clone 与 instruct 是 if/else 二选一）。
 > DSHT 侧无感——voice 字段填克隆音色名即可，走的还是同一个 OpenAI 端点。
+>
+> ⚠️ **但这是本机服务的选择，不是 OmniVoice 库的限制。** 库层面**两者可以共存**：
+> `omnivoice/models/omnivoice.py:1222-1228` 把 `<|instruct_start|>...<|instruct_end|>`
+> **无条件**写进 style token，参考音频是**另外一段**拼接进去的（1254-1258 行），
+> 所以模型能同时看到音色与属性描述。实测（`scratch/verify_instruct_modulates_clone.py`）：
+> 给同一个克隆分别加 `male, low pitch` / `female, high pitch`，**F0 会真实改变**
+> （女声克隆 + `male, low pitch` → F0 从 324 Hz 掉到 113 Hz，降幅 65%）。
+> → 想要「克隆音色 + 属性微调」，直接用 `omnivoice` 库调 `generate(voice_clone_prompt=...,
+> instruct=...)` 即可，本机服务目前不开放这条组合。
 
 ### 3.8 OpenAI 端点请求参数全表（`POST /v1/audio/speech`）
 
