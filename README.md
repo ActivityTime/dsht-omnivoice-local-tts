@@ -25,9 +25,9 @@ DSHT 配音配置：
 | 字段 | 值 |
 |---|---|
 | 方案 | `openai`（OpenAI 兼容） |
-| 接口地址（Provider Endpoint） | `http://127.0.0.1:8890/v1/audio/speech` ⚠️ 含完整路径 |
-| 模型 | `omnivoice`（任意非空） |
-| API Key | 留空 |
+| 接口地址（Provider Endpoint） | `http://127.0.0.1:8890/v1` ⚠️ 只写到 `/v1`，DSHT 会自己补 `/audio/speech` |
+| 模型 | `gpt-4o-mini-tts`（服务端忽略此值；DSHT 仅当名字含 `gpt-4o` 时才发送情绪指令） |
+| API Key | 必填（DSHT 端校验非空），内容随意如 `local`；服务端默认不校验 |
 | 声音列表 | `alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer, verse` |
 | 默认声音 | `alloy` 走映射；或填 `female, elderly, 四川话` 触发文字造声 |
 

@@ -3336,6 +3336,7 @@ _WM_COMMAND = 0x0111
 _ID_OPEN = 1
 _ID_COPY = 2
 _ID_EXIT = 3
+_ID_COPY_ROOT = 4
 
 
 def _tray_open_admin() -> None:
@@ -3347,6 +3348,23 @@ def _tray_open_admin() -> None:
 
 def _tray_copy_endpoint() -> None:
     url = f"http://127.0.0.1:{int(os.environ.get('OMNI_TTS_PORT', '8890'))}/v1/audio/speech"
+    _put_clipboard_text(url)
+    log.info("endpoint copied to clipboard: %s", url)
+
+
+def _tray_copy_root() -> None:
+    """The base URL DSH-Tavern wants: it appends `/audio/speech` itself.
+
+    Copying the full endpoint here would be wrong for that one caller --
+    pasted into its Endpoint field it becomes
+    `/v1/audio/speech/audio/speech` and every line 404s.
+    """
+    url = f"http://127.0.0.1:{int(os.environ.get('OMNI_TTS_PORT', '8890'))}/v1"
+    _put_clipboard_text(url)
+    log.info("base url copied to clipboard: %s", url)
+
+
+def _put_clipboard_text(url: str) -> None:
     try:
         user32, kernel32, _ = _win32()
         if not user32.OpenClipboard(None):
@@ -3361,7 +3379,6 @@ def _tray_copy_endpoint() -> None:
             user32.SetClipboardData(_CF_UNICODETEXT, handle)
         finally:
             user32.CloseClipboard()
-        log.info("endpoint copied to clipboard: %s", url)
     except Exception as error:  # noqa: BLE001
         log.warning("clipboard copy failed: %s", error)
 
@@ -3395,7 +3412,8 @@ def _tray_thread() -> None:
                 elif lparam == _WM_RBUTTONUP:
                     menu = user32.CreatePopupMenu()
                     user32.AppendMenuW(menu, _MF_STRING, _ID_OPEN, "打开管理台")
-                    user32.AppendMenuW(menu, _MF_STRING, _ID_COPY, "复制 OpenAI 端点")
+                    user32.AppendMenuW(menu, _MF_STRING, _ID_COPY, "复制完整端点（curl 等）")
+                    user32.AppendMenuW(menu, _MF_STRING, _ID_COPY_ROOT, "复制 DSHT 根地址")
                     user32.AppendMenuW(menu, _MF_SEPARATOR, 0, None)
                     user32.AppendMenuW(menu, _MF_STRING, _ID_EXIT, "退出服务")
                     pt = _MSG()
@@ -3412,6 +3430,8 @@ def _tray_thread() -> None:
                     _tray_open_admin()
                 elif command == _ID_COPY:
                     _tray_copy_endpoint()
+                elif command == _ID_COPY_ROOT:
+                    _tray_copy_root()
                 elif command == _ID_EXIT:
                     log.info("quit requested from tray icon")
                     os._exit(0)

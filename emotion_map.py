@@ -26,12 +26,39 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
 
 MAP_FILENAME = "emotion_map.json"
+
+# DSH-Tavern does not send a bare emotion word: its "OpenAI compatible"
+# channel wraps the annotated emotion into one fixed sentence, built by
+# `emotionStyle()` in the tavern plugin as
+#   "用" + <Chinese emotion> + "的语气说这句话。"
+# Without stripping that scaffolding the emotion is still matched (matching
+# is by substring) but the leftover shell -- "用 的语气说这句话。" -- goes on
+# to attribute parsing, is not an attribute, and is archived as dropped
+# noise on every single voiced line.
+_DSH_STYLE_SENTENCE = re.compile(
+    r"^\s*用\s*(?P<phrase>[^，,。；;！!？?\s]{1,12}?)\s*的?\s*语气\s*"
+    r"(?:说|讲|念|朗读|读)?\s*(?:这个?这句话?|这句话|这句|话)?\s*[。.！!？?]?\s*$"
+)
+
+
+def strip_style_sentence(text: str) -> str:
+    """Reduce DSH-Tavern's "用X的语气说这句话。" to just the emotion word.
+
+    Anything that is not that exact shape is returned untouched, so a
+    caller's own wording is never mangled.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    match = _DSH_STYLE_SENTENCE.match(raw)
+    return match.group("phrase") if match else raw
 
 
 def map_path() -> Path:
@@ -174,12 +201,18 @@ def extract(
     `mapped` records what was translated and into what.
     """
     if not text or not table:
-        return text or "", [], [], []
+        return text or "", [], [], [], []
+
+    # DSH-Tavern's "用X的语气说这句话。" carries one emotion and a lot of
+    # scaffolding; take the scaffolding off before matching so it does not
+    # end up in the dropped report.
+    residual = strip_style_sentence(text)
+    if not residual:
+        return "", [], [], [], []
 
     # Longest phrase first, so "温柔地" wins over "温柔" when both are
     # present and they map to different things.
     keys = sorted(table, key=len, reverse=True)
-    residual = text
     inline: list[str] = []
     design: list[str] = []
     unmatched: list[str] = []

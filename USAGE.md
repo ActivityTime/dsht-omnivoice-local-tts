@@ -210,7 +210,8 @@ curl http://127.0.0.1:8890/health
 |---|---|
 | 左键单击 | 打开管理控制台（`http://127.0.0.1:8890/admin`） |
 | 右键菜单 → 打开管理台 | 同上 |
-| 右键菜单 → 复制 OpenAI 端点 | 复制 `http://127.0.0.1:8890/v1/audio/speech` 到剪贴板（填 DSHT Provider Endpoint 用） |
+| 右键菜单 → 复制完整端点（curl 等） | 复制 `http://127.0.0.1:8890/v1/audio/speech`（给 curl / 通用 OpenAI 客户端） |
+| 右键菜单 → 复制 DSHT 根地址 | 复制 `http://127.0.0.1:8890/v1`（**填 DSHT 接口地址用**；DSHT 会自己补 `/audio/speech`） |
 | 右键菜单 → 退出服务 | 立即停止服务（`os._exit(0)`，无优雅停机，勿在有合成任务时点） |
 
 - **零依赖**：直接 ctypes 调 `Shell_NotifyIconW` + 自绘 32×32 ICO（圆角蓝底 + 白色音量条），不引入 pystray / Pillow。图标首次启动时写到 `tray.ico`（与 `server.py` 同目录），之后直接复用。
@@ -550,19 +551,67 @@ OmniVoice 的语音设计属性**没有情绪轴**，这些短语原本会被直
 
 ## 4. DSHT 配音接入配置
 
-DSHT 后端把你在界面填的「接口地址」**原样转发**到该 URL（不额外拼路径），所以必须填完整路径。
+DSHT 的 `openai` 渠道会**自己拼路径**：最终请求地址 = 你填的地址去掉末尾斜杠 + `/audio/speech`
+（见 tavern 插件 `lib/domain/speech.js`）。所以这里填**根地址**，不能填完整端点。
 
 | 字段 | 填写值 |
 |---|---|
 | 配音方案 / Provider | `openai`（OpenAI 兼容） |
-| **接口地址（Provider Endpoint）** | `http://127.0.0.1:8890/v1/audio/speech` ⚠️ 必须含完整路径，只写到 `/v1` 会 404 |
-| 模型（Model） | `omnivoice`（服务端忽略此字段，任意非空均可） |
-| API Key | **留空**（服务端 `OMNI_TTS_KEY` 为空时不校验） |
+| **接口地址（Provider Endpoint）** | `http://127.0.0.1:8890/v1` ⚠️ 只写到 `/v1`；DSHT 会补 `/audio/speech`。填成 `.../v1/audio/speech` 会变成 `/v1/audio/speech/audio/speech` 而 404 |
+| 模型（Model） | **服务端忽略此字段**，但 DSHT 用它决定要不要带情绪：模型名匹配 `/gpt-4o/` 时才发送 `instructions`。想要情绪就填 `gpt-4o-mini-tts`（默认值），填别的则整条链路不带情绪 |
+| API Key | **必须填**（DSHT 端校验非空），内容随意，例如 `local`；服务端 `OMNI_TTS_KEY` 为空时不校验 |
 | 声音列表（voices datalist） | `alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer, verse` |
-| 默认声音 | `alloy` 走映射；或直接写 `female, elderly, 四川话` 触发文字造声 |
+| 默认声音 | `alloy` 走映射；或直接写 `female, elderly, 四川话` 触发文字造声；也可直接写克隆音色名 |
+| 旁白声音 | 留空 = 旁白不念；填了则旁白段用它单独请求 |
 
 **文字造声用法**：在声音框直接填属性描述串，如 `female, elderly, 四川话`、
 `male, young, deep, British accent`，服务端未命中 `voices.json` 时整串作为 instruct 透传给 OmniVoice。
+
+### 4.1 DSHT 实际会发送什么（协议真相）
+
+按上表配置后，DSHT 每念一句就发**一次** `POST /v1/audio/speech`，请求体固定 5 个字段、最多 6 个：
+
+```json
+{
+  "model": "gpt-4o-mini-tts",
+  "input": "等、等等，那里不行！我刚吃饱，肚子鼓出来很丑的……",
+  "voice": "ja_Kurumi_0011_恋慕_恋爱情话",
+  "response_format": "mp3",
+  "instructions": "用害羞的语气说这句话。"
+}
+```
+
+| 字段 | 来源 | 说明 |
+|---|---|---|
+| `model` | 配置里的模型名 | 服务端忽略；仅 DSHT 用 `/gpt-4o/` 判断是否发 `instructions` |
+| `input` | 台词文本 | 经 `speechText()` 清洗：删 `<...>` 标签与 `* _ ~ \` # > \|`，压空白，截 1000 字。**方括号不清洗**，所以行内标签可存活 |
+| `voice` | 角色卡 `voices.openai` → 默认声音 → 旁白声音（旁白段） | 三选一；旁白留空则整段跳过、不请求 |
+| `response_format` | 恒为 `mp3` | 服务端按此返回 |
+| `instructions` | `用<中文情绪>的语气说这句话。` | **仅**当模型名含 `gpt-4o` 且情绪非 `neutral` 才出现。情绪由后台 `cast_submit` 标注，取值是下表 28 个英文 key |
+
+**不会**发送：`speed`、`language`、`duration`、`num_step`、`use_instructions`、`normalize_text`。
+这些参数面只对**手写调用**（curl / 管理台）有意义，DSHT 通道一律走服务端默认值（`speed=1.0`、`num_step=32`、`language=auto`）。
+
+情绪词对照（DSHT 侧英文 key → 它发出的中文词 → 服务端映射层目标）：
+
+| key | 中文 | key | 中文 | key | 中文 |
+|---|---|---|---|---|---|
+| admiration | 钦佩 | disgust | 嫌弃 | optimism | 期待 |
+| amusement | 逗乐 | embarrassment | 害羞 | pride | 得意 |
+| anger | 生气 | excitement | 兴奋 | realization | 恍然 |
+| annoyance | 烦躁 | fear | 害怕 | relief | 释然 |
+| approval | 赞同 | gratitude | 感激 | remorse | 懊悔 |
+| caring | 关心 | grief | 悲痛 | sadness | 难过 |
+| confusion | 困惑 | joy | 开心 | surprise | 惊讶 |
+| curiosity | 好奇 | love | 爱慕 | nervousness | 紧张 |
+| desire | 渴望 | neutral | 平静（不发指令） | disappointment | 失望 |
+
+> 映射层收到的是**整句**「用X的语气说这句话。」，会先剥掉句式骨架再按子串匹配 X，
+> 因此上表 28 个词全部覆盖；映射不到的词会记进归档的 `dropped`/`unmatched` 而不是静默吞掉。
+
+**DSHT 侧也有缓存**：它按 `sha256(渠道 + 配置 + voice + emotion + text)` 把音频存进
+`<data>/speech-cache/`。同一个文本改了服务端配置（换模型、改映射表）后，DSHT 不会重新请求——
+排障时若怀疑"改了没生效"，先清那个目录再看。
 
 ---
 
