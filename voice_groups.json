@@ -1,4 +1,17 @@
 {
   "version": 1,
-  "groups": []
+  "groups": [
+    {
+      "name": "时崎狂三",
+      "default": "ja_Kurumi_0011_恋慕_恋爱情话",
+      "note": "",
+      "members": [
+        {
+          "voice": "ja_Kurumi_0005_羞涩_疑问询问",
+          "tag": "期待",
+          "note": ""
+        }
+      ]
+    }
+  ]
 }
